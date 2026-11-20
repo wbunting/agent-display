@@ -1,0 +1,26 @@
+[package]
+name = "agent-display"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "Private headless sway display, input and agent-only Chromium for agents (Rust port)"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "agent-display"
+path = "src/main.rs"
+
+[dependencies]
+# JSON for CDP, sway IPC and the CLI's output. preserve_order: printed
+# objects keep the key order Chromium/sway sent, like Python's dicts.
+serde_json = { version = "1", features = ["preserve_order"] }
+# memfd_create, sendmsg(SCM_RIGHTS), poll, flock, umask, pidfd_open, getuid.
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
