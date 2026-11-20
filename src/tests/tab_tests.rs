@@ -79,6 +79,10 @@ impl Fx {
         out
     }
 
+    pub fn sys_version_fail(&mut self, f: impl Fn(u16) -> Option<Error> + 'static) {
+        self.sys.version_fail = Some(Box::new(f));
+    }
+
     pub fn sw(&self) -> &FakeSway {
         self.sway.as_ref().unwrap()
     }
@@ -450,4 +454,102 @@ sway_only!(gc_removes_leaked_output_but_nothing_unmarked, |f: Fx| {
     assert!(st.outputs.contains(&"HEADLESS-1".to_string()));
     let unplugs: Vec<&String> = st.commands.iter().filter(|c| c.ends_with("unplug")).collect();
     assert_eq!(unplugs, vec!["output HEADLESS-2 unplug"]);
+});
+
+// ------------------------------------------------------------ fix 1
+
+fn close_calls(f: &Fx) -> usize {
+    f.methods().iter().filter(|m| *m == "Target.closeTarget").count()
+}
+
+fn timed_out_close() -> Error {
+    Error::new("timed out waiting for Target.closeTarget")
+}
+
+both!(ownership_check_waits_15s_for_a_stalled_browser, |f: Fx| {
+    let (code, _, _) = f.cli(&["list"]);
+    assert_eq!(code, 0);
+    assert_eq!(*f.sys.version_timeouts.borrow(), vec![15.0]);
+    assert_eq!(*f.sys.targets_timeouts.borrow(), vec![15.0]);
+});
+
+both!(close_retries_after_a_timeout, |f: Fx| {
+    let tab = f.open(&[])["tab"].as_str().unwrap().to_string();
+    let mut first = true;
+    f.b.set_hook(move |m, _| {
+        if m == "Target.closeTarget" && first {
+            first = false;
+            return Hook::Return(Err(timed_out_close()));
+        }
+        Hook::Pass
+    });
+    f.sys.sleeps.borrow_mut().clear();
+    let (code, out, err) = f.cli(&["close", &tab]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["closed"], tab.as_str());
+    assert!(!f.b.has(&tab));
+    assert_eq!(close_calls(&f), 2);
+    assert_eq!(f.sys.sleeps.borrow().iter().filter(|s| **s >= 1.0).count(), 1);
+});
+
+both!(close_that_went_through_late_counts_as_closed, |f: Fx| {
+    let tab = f.open(&[])["tab"].as_str().unwrap().to_string();
+    // Chromium closed it but the reply never came in time.
+    f.b.set_hook(|m, _| if m == "Target.closeTarget" { Hook::DefaultThen(timed_out_close()) } else { Hook::Pass });
+    let (code, out, err) = f.cli(&["close", &tab]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["port"], 9425);
+    assert!(!f.b.has(&tab));
+    assert_eq!(close_calls(&f), 1);
+});
+
+both!(close_gives_up_after_three_attempts, |f: Fx| {
+    let tab = f.open(&[])["tab"].as_str().unwrap().to_string();
+    f.b.set_hook(|m, _| if m == "Target.closeTarget" { Hook::Return(Err(timed_out_close())) } else { Hook::Pass });
+    f.sys.sleeps.borrow_mut().clear();
+    let (code, _, err) = f.cli(&["close", &tab]);
+    assert_eq!(code, 1);
+    assert!(err.contains("timed out waiting for Target.closeTarget"), "{err}");
+    assert_eq!(close_calls(&f), 3);
+    let backoff: Vec<f64> = f.sys.sleeps.borrow().iter().copied().filter(|s| *s >= 1.0).collect();
+    assert_eq!(backoff, vec![1.0, 2.0]);
+});
+
+#[test]
+fn close_fails_fast_when_the_browser_unit_is_not_active() {
+    let mut f = Fx::new(false);
+    let tab = f.open(&[])["tab"].as_str().unwrap().to_string();
+    f.b.set_hook(|m, _| if m == "Target.closeTarget" { Hook::Return(Err(timed_out_close())) } else { Hook::Pass });
+    f.sys.active = Some(false); // browsers() is stubbed; only the retry asks systemd
+    let (code, _, _) = f.cli(&["close", &tab]);
+    assert_eq!(code, 1);
+    assert_eq!(close_calls(&f), 1);
+    assert!(f.sys.sleeps.borrow().is_empty());
+}
+
+both!(close_never_retries_refusals, |f: Fx| {
+    *f.ready.borrow_mut() = Box::new(|_| false);
+    let (code, _, err) = f.cli(&["close", "OTHERTAB00000001"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("not served from"), "{err}");
+    assert!(f.sys.sleeps.borrow().is_empty());
+    assert!(f.calls().is_empty());
+});
+
+both!(close_retries_when_lookup_skipped_a_stalled_browser, |mut f: Fx| {
+    let tab = f.open(&[])["tab"].as_str().unwrap().to_string();
+    let stalls = Rc::new(RefCell::new(1));
+    let s2 = stalls.clone();
+    f.sys_version_fail(move |_| {
+        let mut n = s2.borrow_mut();
+        if *n > 0 {
+            *n -= 1;
+            return Some(Error::os("timed out"));
+        }
+        None
+    });
+    let (code, _, err) = f.cli(&["close", &tab]);
+    assert_eq!(code, 0, "{err}");
+    assert!(!f.b.has(&tab));
+    assert_eq!(*stalls.borrow(), 0);
 });

@@ -13,7 +13,9 @@ use crate::util::{Result, resolve, unlink_missing_ok, write_private};
 use crate::{bail, json, tab};
 
 /// `/json/version` timeout of the ownership check used by `tab` commands.
-pub const OWNERSHIP_TIMEOUT: f64 = 5.0;
+/// The shared browser can stall for seconds under host load; 5 s (the
+/// Python's) failed every tab command during such stalls.
+pub const OWNERSHIP_TIMEOUT: f64 = 15.0;
 
 /// Browser profiles that belong to the user or other tools.
 pub fn forbidden_profile_roots(ctx: &Ctx) -> Vec<PathBuf> {
@@ -117,7 +119,8 @@ pub fn devtools_port(profile: &Path) -> Option<u16> {
 
 /// Why `port` isn't our browser's CDP, or None if it is. The listener must
 /// be inside the browser unit AND answer CDP. The one ownership check used
-/// by readiness, `browser stop` and `tab`.
+/// by readiness, `browser stop` and `tab`. Not running means no listener in
+/// the unit (no cgroup), so that fails at once without waiting on HTTP.
 pub fn cdp_problem(ctx: &Ctx, port: u16, unit: &str, timeout: f64) -> Option<String> {
     if !ctx.sys.listener_in_unit(ctx, port, &unit_name(unit)) {
         return Some(format!("CDP on port {port} is not served from {unit}"));

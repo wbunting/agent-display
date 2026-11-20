@@ -103,6 +103,8 @@ pub struct FakeSys {
     pub port_free: Option<bool>,
     pub port_owner: Option<String>,
     pub version_calls: RefCell<usize>,
+    pub version_timeouts: RefCell<Vec<f64>>,
+    pub targets_timeouts: RefCell<Vec<f64>>,
     pub version_fail: Option<Box<dyn Fn(u16) -> Option<Error>>>,
     pub browser: Option<FakeBrowser>,
     pub sway: Option<FakeSway>,
@@ -172,14 +174,16 @@ impl Sys for FakeSys {
     fn port_owner(&self, _ctx: &Ctx, _port: u16) -> String {
         self.port_owner.clone().unwrap_or_else(|| "unknown process".into())
     }
-    fn cdp_version(&self, port: u16, _timeout: f64) -> Result<Value> {
+    fn cdp_version(&self, port: u16, timeout: f64) -> Result<Value> {
         *self.version_calls.borrow_mut() += 1;
+        self.version_timeouts.borrow_mut().push(timeout);
         if let Some(e) = self.version_fail.as_ref().and_then(|f| f(port)) {
             return Err(e);
         }
         Ok(json!({}))
     }
-    fn cdp_targets(&self, _port: u16, _timeout: f64) -> Result<Vec<Value>> {
+    fn cdp_targets(&self, _port: u16, timeout: f64) -> Result<Vec<Value>> {
+        self.targets_timeouts.borrow_mut().push(timeout);
         match &self.browser {
             Some(b) => b.list(),
             None => Ok(vec![]),

@@ -28,8 +28,11 @@ use crate::display::{display, ensure_runtime_dir, walk, windows};
 use crate::util::{Error, Result, absolute, b64decode, fmt_g, hex, py_repr, random_bytes, unlink_missing_ok, write_private};
 use crate::{bail, json};
 
-/// `/json/list` timeout.
-pub const TARGETS_TIMEOUT: f64 = 5.0;
+/// `/json/list` timeout. Raised with the ownership check (5 s in the
+/// Python): it is the same stalled HTTP server.
+pub const TARGETS_TIMEOUT: f64 = 15.0;
+/// `tab close` attempts while the browser unit stays active (fix 1).
+pub const CLOSE_ATTEMPTS: u32 = 3;
 
 pub fn valid_tab_id(tab: &str) -> bool {
     (8..=64).contains(&tab.len()) && tab.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
@@ -666,12 +669,59 @@ pub fn cmd_tab_info(ctx: &Ctx, o: &TabOpts, tab: &str) -> Result<i32> {
     Ok(0)
 }
 
+/// Worth another `tab close` attempt: the browser was slow or the
+/// connection broke (also when the lookup skipped a browser for that), not
+/// an ownership refusal or a missing tab.
+fn retryable(e: &Error) -> bool {
+    e.os || e.is_timeout() || e.msg.contains("is not answering CDP") || e.msg.contains("CDP closed")
+}
+
+fn unit_for_port(ctx: &Ctx, port: u16) -> Option<String> {
+    owned_ports(ctx).into_iter().find(|(p, _)| *p == port as i64).map(|(_, u)| u)
+}
+
+/// `tab close`, retried (fix 1): under host load the shared browser can
+/// stall for seconds, and a failed close used to leave the tab open.
+/// Retries only while the tab's browser unit is still active, so a stopped
+/// browser still fails at once. If an earlier attempt sent closeTarget and
+/// the tab is now gone, that attempt closed it.
 pub fn cmd_tab_close(ctx: &Ctx, o: &TabOpts, tab: &str) -> Result<i32> {
-    let (port, _) = find_tab(ctx, tab, o.port_raw)?;
-    let ok = close_target(ctx, port, tab)?;
-    if ok.get("success") == Some(&Value::Bool(false)) {
-        bail!("could not close {tab}");
-    }
+    let mut found_on: Option<u16> = None;
+    let mut attempt = 0;
+    let port = loop {
+        attempt += 1;
+        let r = (|| -> Result<u16> {
+            let (port, _) = find_tab(ctx, tab, o.port_raw)?;
+            found_on = Some(port);
+            let ok = close_target(ctx, port, tab)?;
+            if ok.get("success") == Some(&Value::Bool(false)) {
+                bail!("could not close {tab}");
+            }
+            Ok(port)
+        })();
+        match r {
+            Ok(port) => break port,
+            Err(e) => {
+                if let Some(port) = found_on
+                    && e.msg.starts_with(&format!("no tab {tab} in an agent-display browser"))
+                    && !e.msg.contains("skipped unhealthy")
+                {
+                    break port; // the earlier closeTarget went through
+                }
+                if attempt >= CLOSE_ATTEMPTS || !retryable(&e) {
+                    return Err(e);
+                }
+                let units: Vec<String> = match found_on {
+                    Some(p) => unit_for_port(ctx, p).into_iter().collect(),
+                    None => owned_ports(ctx).into_iter().map(|(_, u)| u).collect(),
+                };
+                if !units.iter().any(|u| ctx.sys.unit_active(ctx, u)) {
+                    return Err(e);
+                }
+                ctx.sys.sleep(attempt as f64);
+            }
+        }
+    };
     let output = remove_tab_output(ctx, tab, 5.0);
     let mut out = Map::new();
     out.insert("closed".into(), tab.into());
