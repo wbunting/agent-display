@@ -453,6 +453,55 @@ fn tab_and_readiness_share_one_check() {
     assert_eq!(*sys.version_calls.borrow(), 0);
 }
 
+#[test]
+fn listener_ownership_from_proc_and_unit_cgroup() {
+    // Fix 2: /proc/net/tcp{,6} LISTEN inode + an fd for it in the unit's
+    // cgroup pids, instead of `ss -Hltnp`.
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let own = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+    let own = own.lines().find_map(|l| l.strip_prefix("0::")).unwrap().to_string();
+    let t = TempHome::new();
+    let check = |cg: Option<&str>, port: u16| {
+        let sys = FakeSys { cgroup: Some(cg.map(String::from)), ..Default::default() };
+        let ctx = t.ctx(&sys);
+        sys.listener_in_unit(&ctx, port, "agent-display-browser")
+    };
+    assert!(check(Some(&own), port), "our listener, our cgroup");
+    assert!(!check(Some("/init.scope"), port), "listener outside the unit");
+    assert!(!check(None, port), "unit not running: no cgroup");
+    drop(l);
+    assert!(!check(Some(&own), port), "nothing listening");
+}
+
+#[test]
+fn unit_state_and_cgroup_come_from_one_systemctl_call() {
+    struct Show;
+    impl Sys for Show {
+        fn run(&self, _: &Ctx, argv: &[String], _: Option<&Environ>, _: Option<f64>, _: bool) -> crate::util::Result<String> {
+            assert_eq!(&argv[..3], &["systemctl", "--user", "show"]);
+            Ok("ActiveState=active\nControlGroup=/user.slice/x/agent-display-browser.service".into())
+        }
+    }
+    let t = TempHome::new();
+    let sys = Show;
+    let ctx = Ctx::new(t.env(), &sys, Box::new(std::io::sink()), Box::new(std::io::sink()));
+    assert!(systemd::unit_active(&ctx, "agent-display-browser"));
+    assert_eq!(
+        ctx.cgroups.borrow().get("agent-display-browser.service").map(String::as_str),
+        Some("/user.slice/x/agent-display-browser.service")
+    );
+    // Cached: no second systemctl for the ownership check.
+    struct NoRun;
+    impl Sys for NoRun {
+        fn run(&self, _: &Ctx, _: &[String], _: Option<&Environ>, _: Option<f64>, _: bool) -> crate::util::Result<String> {
+            panic!("unexpected systemctl call")
+        }
+    }
+    let ctx2 = Ctx { sys: &NoRun, ..ctx };
+    assert_eq!(systemd::unit_cgroup(&ctx2, "agent-display-browser").as_deref(), Some("/user.slice/x/agent-display-browser.service"));
+}
+
 // ------------------------------------------------------------ type
 
 #[test]

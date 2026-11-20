@@ -1,5 +1,13 @@
 //! Port and process ownership checks.
+//!
+//! `listener_in_unit` replaces the Python's `ss -Hltnp` scan (20-25 ms: it
+//! walks every process's fds): find the LISTEN socket inodes for the port in
+//! `/proc/net/tcp{,6}`, then look for an fd pointing at one of them in only
+//! the processes of the unit's cgroup. Same property: the listening socket
+//! belongs to a pid inside the unit.
 
+
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::ctx::Ctx;
@@ -15,22 +23,97 @@ pub fn pid_in_unit(pid: u32, unit: &str) -> bool {
     cgroup.lines().any(|l| l.ends_with(&tail) || l.contains(&mid))
 }
 
-/// PIDs listening on `port`, from `ss -Hltnp` (as the Python does).
-pub fn listener_pids(ctx: &Ctx, port: u16) -> Vec<u32> {
-    let out = systemd::run(ctx, &["ss", "-Hltnp", &format!("sport = :{port}")], None, Some(15.0), false)
-        .unwrap_or_default();
+/// Inodes of TCP sockets in LISTEN state on `port` (any local address).
+pub fn listen_inodes(port: u16) -> HashSet<u64> {
+    let mut out = HashSet::new();
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        if let Ok(text) = std::fs::read_to_string(table) {
+            out.extend(parse_listen_inodes(&text, port));
+        }
+    }
+    out
+}
+
+pub fn parse_listen_inodes(table: &str, port: u16) -> Vec<u64> {
+    let mut out = Vec::new();
+    for line in table.lines().skip(1) {
+        // sl local_address rem_address st tx:rx tr:when retrnsmt uid timeout inode
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 10 || f[3] != "0A" {
+            continue;
+        }
+        let Some((_, p)) = f[1].rsplit_once(':') else { continue };
+        if u16::from_str_radix(p, 16).ok() != Some(port) {
+            continue;
+        }
+        if let Ok(inode) = f[9].parse::<u64>()
+            && inode != 0
+        {
+            out.push(inode);
+        }
+    }
+    out
+}
+
+/// Every pid in the cgroup directory and its descendants.
+pub fn cgroup_pids(dir: &Path) -> Vec<u32> {
     let mut pids = Vec::new();
-    for part in out.split("pid=").skip(1) {
-        let digits: String = part.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if let Ok(p) = digits.parse() {
-            pids.push(p);
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        if let Ok(text) = std::fs::read_to_string(d.join("cgroup.procs")) {
+            pids.extend(text.lines().filter_map(|l| l.trim().parse::<u32>().ok()));
+        }
+        if let Ok(rd) = std::fs::read_dir(&d) {
+            for e in rd.flatten() {
+                if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    stack.push(e.path());
+                }
+            }
         }
     }
     pids
 }
 
+/// Does `pid` hold an fd for one of `inodes`?
+pub fn pid_has_socket(pid: u32, inodes: &HashSet<u64>) -> bool {
+    let Ok(rd) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    for e in rd.flatten() {
+        if let Ok(target) = std::fs::read_link(e.path()) {
+            let t = target.as_os_str().as_encoded_bytes();
+            if let Some(rest) = t.strip_prefix(b"socket:[")
+                && let Some(num) = rest.strip_suffix(b"]")
+                && let Some(inode) = std::str::from_utf8(num).ok().and_then(|s| s.parse::<u64>().ok())
+                && inodes.contains(&inode)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// A cgroup path from systemd, as a directory under /sys/fs/cgroup.
+pub fn cgroup_dir(cgroup: &str) -> Option<PathBuf> {
+    if !cgroup.starts_with('/') || cgroup.split('/').any(|c| c == ".." || c == ".") {
+        return None;
+    }
+    Some(PathBuf::from(format!("/sys/fs/cgroup{cgroup}")))
+}
+
 pub fn listener_in_unit(ctx: &Ctx, port: u16, unit: &str) -> bool {
-    listener_pids(ctx, port).into_iter().any(|pid| ctx.sys.pid_in_unit(pid, &systemd::unit_name(unit)))
+    let inodes = listen_inodes(port);
+    if inodes.is_empty() {
+        return false;
+    }
+    let Some(cg) = ctx.sys.unit_cgroup(ctx, &systemd::unit_name(unit)) else {
+        return false;
+    };
+    let Some(dir) = cgroup_dir(&cg) else {
+        return false;
+    };
+    cgroup_pids(&dir).into_iter().any(|pid| pid_has_socket(pid, &inodes))
 }
 
 pub fn port_owner(ctx: &Ctx, port: u16) -> String {
@@ -108,11 +191,44 @@ pub fn mkdtemp(prefix: &str, dir: &Path) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    const TCP: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:24D1 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 4242 1 0000000000000000 100 0 0 10 0
+   1: 0100007F:24D1 0100007F:9C40 01 00000000:00000000 00:00000000 00000000  1000        0 5555 1 0000000000000000 20 4 30 10 -1
+   2: 0100007F:24D2 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 7777 1 0000000000000000 100 0 0 10 0
+";
+
     #[test]
-    fn listener_pids_parse_ss_output() {
-        let line = r#"LISTEN 0 10 127.0.0.1:9425 0.0.0.0:* users:(("chromium",pid=4242,fd=88),("x",pid=7,fd=1))"#;
-        let pids: Vec<u32> = line.split("pid=").skip(1)
-            .filter_map(|p| p.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().ok()).collect();
-        assert_eq!(pids, vec![4242, 7]);
+    fn finds_only_listen_sockets_on_the_port() {
+        assert_eq!(parse_listen_inodes(TCP, 9425), vec![4242]);
+        assert_eq!(parse_listen_inodes(TCP, 9426), vec![7777]);
+        assert!(parse_listen_inodes(TCP, 80).is_empty());
+    }
+
+    #[test]
+    fn real_listener_found_in_own_process_only() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let inodes = listen_inodes(port);
+        assert_eq!(inodes.len(), 1);
+        assert!(pid_has_socket(std::process::id(), &inodes));
+        assert!(!pid_has_socket(1, &inodes));
+    }
+
+    #[test]
+    fn cgroup_paths_are_validated() {
+        assert!(cgroup_dir("/user.slice/a.service").is_some());
+        assert!(cgroup_dir("").is_none());
+        assert!(cgroup_dir("relative").is_none());
+        assert!(cgroup_dir("/a/../../etc").is_none());
+    }
+
+    #[test]
+    fn own_cgroup_contains_self() {
+        let cg = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+        let path = cg.lines().find_map(|l| l.strip_prefix("0::")).unwrap().to_string();
+        let pids = cgroup_pids(&cgroup_dir(&path).unwrap());
+        assert!(pids.contains(&std::process::id()));
     }
 }

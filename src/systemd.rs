@@ -35,8 +35,37 @@ pub fn unit_name(name: &str) -> String {
     if name.ends_with(".service") { name.to_string() } else { format!("{name}.service") }
 }
 
+/// One `systemctl show` for the state, and the cgroup remembered for this
+/// process (a unit's cgroup path is fixed by its name).
 pub fn unit_active(ctx: &Ctx, name: &str) -> bool {
-    run(ctx, &["systemctl", "--user", "is-active", &unit_name(name)], None, Some(15.0), false).unwrap_or_default() == "active"
+    let unit = unit_name(name);
+    let out = run(ctx, &["systemctl", "--user", "show", "-p", "ActiveState", "-p", "ControlGroup", &unit], None, Some(15.0), false)
+        .unwrap_or_default();
+    let mut active = false;
+    for line in out.lines() {
+        if let Some(v) = line.strip_prefix("ActiveState=") {
+            active = v == "active";
+        } else if let Some(v) = line.strip_prefix("ControlGroup=")
+            && !v.is_empty()
+        {
+            ctx.cgroups.borrow_mut().insert(unit.clone(), v.to_string());
+        }
+    }
+    active
+}
+
+pub fn unit_cgroup(ctx: &Ctx, name: &str) -> Option<String> {
+    let unit = unit_name(name);
+    if let Some(cg) = ctx.cgroups.borrow().get(&unit) {
+        return Some(cg.clone());
+    }
+    let out = run(ctx, &["systemctl", "--user", "show", "-P", "ControlGroup", &unit], None, Some(15.0), false).ok()?;
+    let cg = out.trim().to_string();
+    if cg.is_empty() {
+        return None;
+    }
+    ctx.cgroups.borrow_mut().insert(unit, cg.clone());
+    Some(cg)
 }
 
 pub fn agent_units(ctx: &Ctx, prefix: &str) -> Vec<String> {

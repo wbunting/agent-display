@@ -96,6 +96,8 @@ pub struct FakeSys {
     pub active_fn: Option<UnitFn>,
     pub browsers: RefCell<Option<Vec<BrowserInfo>>>,
     pub listener: Option<ListenerFn>,
+    /// `Some`: unit_cgroup answers this and listener_in_unit runs for real.
+    pub cgroup: Option<Option<String>>,
     pub pid_in_unit: Option<bool>,
     pub pid_checks: RefCell<Vec<(u32, String)>>,
     pub port_free: Option<bool>,
@@ -151,8 +153,14 @@ impl Sys for FakeSys {
             None => crate::browser::browsers_real(ctx),
         }
     }
-    fn listener_in_unit(&self, _ctx: &Ctx, port: u16, unit: &str) -> bool {
+    fn listener_in_unit(&self, ctx: &Ctx, port: u16, unit: &str) -> bool {
+        if self.cgroup.is_some() {
+            return crate::net::listener_in_unit(ctx, port, unit);
+        }
         self.listener.as_ref().is_some_and(|f| f(port, unit))
+    }
+    fn unit_cgroup(&self, _ctx: &Ctx, _unit: &str) -> Option<String> {
+        self.cgroup.clone().flatten()
     }
     fn pid_in_unit(&self, pid: u32, unit: &str) -> bool {
         self.pid_checks.borrow_mut().push((pid, unit.to_string()));

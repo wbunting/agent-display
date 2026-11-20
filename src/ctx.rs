@@ -149,6 +149,10 @@ pub trait Sys {
     fn unit_active(&self, ctx: &Ctx, unit: &str) -> bool {
         systemd::unit_active(ctx, unit)
     }
+    /// The unit's cgroup path (`ControlGroup`), if it has one.
+    fn unit_cgroup(&self, ctx: &Ctx, unit: &str) -> Option<String> {
+        systemd::unit_cgroup(ctx, unit)
+    }
     fn stop_units(&self, ctx: &Ctx, units: &[String]) -> Result<()> {
         systemd::stop_units(ctx, units)
     }
@@ -213,6 +217,9 @@ pub struct Ctx<'a> {
     pub hostname: String,
     /// This executable (the sway config's `exec ... hold-input`).
     pub exe: PathBuf,
+    /// ControlGroup per unit, learned from systemctl in this process (a
+    /// unit's cgroup path is fixed by its name; pids are re-read each check).
+    pub cgroups: RefCell<std::collections::HashMap<String, String>>,
 }
 
 impl<'a> Ctx<'a> {
@@ -225,6 +232,7 @@ impl<'a> Ctx<'a> {
             uid: crate::util::getuid(),
             hostname: crate::util::hostname(),
             exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("agent-display")),
+            cgroups: RefCell::new(Default::default()),
         }
     }
 
