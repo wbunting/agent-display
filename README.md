@@ -1,7 +1,7 @@
 # agent-display
 
 Rust port of the `agent-display` tool from `wbunting/dotfiles`
-(`skills/agent-display/agent-display`, Python, at c598528): a private
+(`skills/agent-display/agent-display`, Python, at c598528; that repo is private): a private
 headless sway display, input and agent-only Chromium for agents on the
 Omarchy host, plus `agent-display tab` commands to drive a tab over CDP.
 The skill docs (`SKILL.md` next to the Python) describe the behaviour; this
@@ -107,3 +107,7 @@ ln -sfn ~/.local/src/dotfiles/skills/agent-display/agent-display ~/.local/bin/ag
 
 A display started by the Python keeps running its Python `hold-input`; the
 next `agent-display start` after a stop runs this binary's.
+
+## License
+
+GPL-3.0-or-later. See [LICENSE](LICENSE).

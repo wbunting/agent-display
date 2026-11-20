@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
 description = "Private headless sway display, input and agent-only Chromium for agents (Rust port)"
-license = "MIT"
+license = "GPL-3.0-or-later"
 publish = false
 
 [[bin]]
