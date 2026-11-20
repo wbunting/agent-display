@@ -31,6 +31,10 @@ use crate::{bail, json};
 /// `/json/list` timeout. Raised with the ownership check (5 s in the
 /// Python): it is the same stalled HTTP server.
 pub const TARGETS_TIMEOUT: f64 = 15.0;
+/// sway poll interval while a tab window appears/disappears. The Python
+/// polls every 20 ms because each poll spawns swaymsg; over IPC a poll
+/// costs ~0.3 ms.
+pub const WINDOW_POLL: f64 = 0.005;
 /// `tab close` attempts while the browser unit stays active (fix 1).
 pub const CLOSE_ATTEMPTS: u32 = 3;
 
@@ -449,7 +453,7 @@ pub fn find_window_real(ctx: &Ctx, disp: &Disp, title: &str, timeout: f64) -> Op
         if win.is_some() || Instant::now() > deadline {
             return win;
         }
-        ctx.sys.sleep(0.02);
+        ctx.sys.sleep(WINDOW_POLL);
     }
 }
 
@@ -586,7 +590,7 @@ pub fn remove_tab_output(ctx: &Ctx, tab: &str, timeout: f64) -> Option<String> {
         if !busy || Instant::now() >= deadline {
             break;
         }
-        ctx.sys.sleep(0.02);
+        ctx.sys.sleep(WINDOW_POLL);
     }
     let _lock = OutputsLock::acquire(ctx).ok()?;
     gc_tab_outputs(ctx, &disp).ok()?.contains(&output).then_some(output)
