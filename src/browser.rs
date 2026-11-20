@@ -94,15 +94,20 @@ pub fn browsers_real(ctx: &Ctx) -> Vec<BrowserInfo> {
     let mut files: Vec<PathBuf> =
         rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "json")).collect();
     files.sort();
-    let mut out = Vec::new();
+    let mut found = Vec::new();
     for f in files {
         let Ok(text) = std::fs::read_to_string(&f) else { continue };
         let Ok(Value::Object(info)) = serde_json::from_str::<Value>(&text) else { continue };
         let info = BrowserInfo(info);
-        if info.unit().is_empty() {
-            continue;
+        if !info.unit().is_empty() {
+            found.push((f, info));
         }
-        if ctx.sys.unit_active(ctx, info.unit()) {
+    }
+    let units: Vec<String> = found.iter().map(|(_, i)| i.unit().to_string()).collect();
+    let active = ctx.sys.units_active(ctx, &units);
+    let mut out = Vec::new();
+    for ((f, info), active) in found.into_iter().zip(active) {
+        if active {
             out.push(info);
         } else {
             unlink_missing_ok(&f);

@@ -5,6 +5,7 @@
 mod fakes;
 mod tab_tests;
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
 use fakes::*;
@@ -196,7 +197,7 @@ fn systemctl_runs_with_manager_env() {
     assert_eq!(env.get("XDG_RUNTIME_DIR"), Some(t.rt.to_str().unwrap()));
     assert!(env.get("DBUS_SESSION_BUS_ADDRESS").is_none());
     // and unit_active goes through run() with no explicit env
-    systemd::unit_active(&ctx, "agent-display");
+    systemd::units_active(&ctx, &["agent-display".to_string()]);
     let runs = sys.runs.borrow();
     assert_eq!(runs[0].0[0], "systemctl");
     assert!(runs[0].1.is_none());
@@ -476,30 +477,48 @@ fn listener_ownership_from_proc_and_unit_cgroup() {
 
 #[test]
 fn unit_state_and_cgroup_come_from_one_systemctl_call() {
-    struct Show;
+    struct Show(RefCell<Vec<Vec<String>>>);
     impl Sys for Show {
         fn run(&self, _: &Ctx, argv: &[String], _: Option<&Environ>, _: Option<f64>, _: bool) -> crate::util::Result<String> {
-            assert_eq!(&argv[..3], &["systemctl", "--user", "show"]);
-            Ok("ActiveState=active\nControlGroup=/user.slice/x/agent-display-browser.service".into())
+            self.0.borrow_mut().push(argv.to_vec());
+            Ok("Id=agent-display-browser.service\nActiveState=active\nControlGroup=/a/agent-display-browser.service\nMainPID=42\n\n\
+                Id=agent-display-browser-tmp-x.service\nActiveState=inactive\nControlGroup=\nMainPID=0".into())
         }
     }
     let t = TempHome::new();
-    let sys = Show;
+    let sys = Show(RefCell::new(vec![]));
     let ctx = Ctx::new(t.env(), &sys, Box::new(std::io::sink()), Box::new(std::io::sink()));
-    assert!(systemd::unit_active(&ctx, "agent-display-browser"));
+    let units = vec!["agent-display-browser".to_string(), "agent-display-browser-tmp-x".to_string()];
+    assert_eq!(systemd::units_active(&ctx, &units), vec![true, false]);
+    let calls = sys.0.borrow().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(&calls[0][..3], &["systemctl", "--user", "show"]);
+    assert_eq!(&calls[0][calls[0].len() - 2..], &["agent-display-browser.service", "agent-display-browser-tmp-x.service"]);
     assert_eq!(
-        ctx.cgroups.borrow().get("agent-display-browser.service").map(String::as_str),
-        Some("/user.slice/x/agent-display-browser.service")
+        ctx.units.borrow().get("agent-display-browser.service"),
+        Some(&systemd::UnitInfo { cgroup: "/a/agent-display-browser.service".into(), main_pid: 42 })
     );
-    // Cached: no second systemctl for the ownership check.
-    struct NoRun;
-    impl Sys for NoRun {
-        fn run(&self, _: &Ctx, _: &[String], _: Option<&Environ>, _: Option<f64>, _: bool) -> crate::util::Result<String> {
-            panic!("unexpected systemctl call")
-        }
-    }
-    let ctx2 = Ctx { sys: &NoRun, ..ctx };
-    assert_eq!(systemd::unit_cgroup(&ctx2, "agent-display-browser").as_deref(), Some("/user.slice/x/agent-display-browser.service"));
+    // Cached: the ownership check needs no second systemctl call.
+    assert_eq!(systemd::unit_cgroup(&ctx, "agent-display-browser").as_deref(), Some("/a/agent-display-browser.service"));
+    assert_eq!(sys.0.borrow().len(), 1);
+    // A unit that isn't running has no cgroup.
+    assert_eq!(ctx.units.borrow().get("agent-display-browser-tmp-x.service"), None);
+}
+
+#[test]
+fn browsers_registry_drops_inactive_units_in_one_query() {
+    let t = TempHome::new();
+    let sys = FakeSys { active_fn: Some(Box::new(|u| !u.contains("tmp"))), ..Default::default() };
+    let ctx = t.ctx(&sys);
+    let dir = ctx.browsers_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("agent-display-browser.json"), r#"{"unit": "agent-display-browser", "port": 9425, "profile": "/p", "temp": false}"#).unwrap();
+    std::fs::write(dir.join("agent-display-browser-tmp-x.json"), r#"{"unit": "agent-display-browser-tmp-x", "port": 1, "profile": "/q", "temp": true}"#).unwrap();
+    std::fs::write(dir.join("junk.json"), "not json").unwrap();
+    let got = crate::browser::browsers_real(&ctx);
+    assert_eq!(got.iter().map(|b| b.unit()).collect::<Vec<_>>(), vec!["agent-display-browser"]);
+    assert!(!dir.join("agent-display-browser-tmp-x.json").exists());
+    assert!(dir.join("junk.json").exists());
 }
 
 // ------------------------------------------------------------ type

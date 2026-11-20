@@ -113,7 +113,14 @@ pub fn listener_in_unit(ctx: &Ctx, port: u16, unit: &str) -> bool {
     let Some(dir) = cgroup_dir(&cg) else {
         return false;
     };
-    cgroup_pids(&dir).into_iter().any(|pid| pid_has_socket(pid, &inodes))
+    let mut pids = cgroup_pids(&dir);
+    // Chromium's main process holds the listener: look there first. Only
+    // the order changes; every pid scanned still comes from cgroup.procs.
+    let main = ctx.units.borrow().get(&systemd::unit_name(unit)).map(|u| u.main_pid);
+    if let Some(i) = main.and_then(|m| pids.iter().position(|p| *p == m)) {
+        pids.swap(0, i);
+    }
+    pids.into_iter().any(|pid| pid_has_socket(pid, &inodes))
 }
 
 pub fn port_owner(ctx: &Ctx, port: u16) -> String {

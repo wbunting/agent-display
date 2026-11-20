@@ -149,6 +149,10 @@ pub trait Sys {
     fn unit_active(&self, ctx: &Ctx, unit: &str) -> bool {
         systemd::unit_active(ctx, unit)
     }
+    /// Several units in one systemctl call.
+    fn units_active(&self, ctx: &Ctx, units: &[String]) -> Vec<bool> {
+        systemd::units_active(ctx, units)
+    }
     /// The unit's cgroup path (`ControlGroup`), if it has one.
     fn unit_cgroup(&self, ctx: &Ctx, unit: &str) -> Option<String> {
         systemd::unit_cgroup(ctx, unit)
@@ -217,9 +221,9 @@ pub struct Ctx<'a> {
     pub hostname: String,
     /// This executable (the sway config's `exec ... hold-input`).
     pub exe: PathBuf,
-    /// ControlGroup per unit, learned from systemctl in this process (a
-    /// unit's cgroup path is fixed by its name; pids are re-read each check).
-    pub cgroups: RefCell<std::collections::HashMap<String, String>>,
+    /// Per unit, learned from systemctl in this process: cgroup path (fixed
+    /// by the unit name; its pids are re-read on every check) and main pid.
+    pub units: RefCell<std::collections::HashMap<String, systemd::UnitInfo>>,
 }
 
 impl<'a> Ctx<'a> {
@@ -232,7 +236,7 @@ impl<'a> Ctx<'a> {
             uid: crate::util::getuid(),
             hostname: crate::util::hostname(),
             exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("agent-display")),
-            cgroups: RefCell::new(Default::default()),
+            units: RefCell::new(Default::default()),
         }
     }
 

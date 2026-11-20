@@ -11,6 +11,16 @@ publish = false
 name = "agent-display"
 path = "src/main.rs"
 
+# Benchmark build with per-phase timings (not installed):
+#   cargo build --release --features bench-trace
+[[bin]]
+name = "agent-display-trace"
+path = "src/bin/agent-display-trace.rs"
+required-features = ["bench-trace"]
+
+[features]
+bench-trace = []
+
 [dependencies]
 # JSON for CDP, sway IPC and the CLI's output. preserve_order: printed
 # objects keep the key order Chromium/sway sent, like Python's dicts.

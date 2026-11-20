@@ -137,6 +137,9 @@ impl Sys for FakeSys {
         }
         self.active.unwrap_or(false)
     }
+    fn units_active(&self, ctx: &Ctx, units: &[String]) -> Vec<bool> {
+        units.iter().map(|u| self.unit_active(ctx, u)).collect()
+    }
     fn stop_units(&self, _ctx: &Ctx, units: &[String]) -> Result<()> {
         if !units.is_empty() {
             self.stopped.borrow_mut().push(units.to_vec());

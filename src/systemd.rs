@@ -35,37 +35,73 @@ pub fn unit_name(name: &str) -> String {
     if name.ends_with(".service") { name.to_string() } else { format!("{name}.service") }
 }
 
-/// One `systemctl show` for the state, and the cgroup remembered for this
-/// process (a unit's cgroup path is fixed by its name).
-pub fn unit_active(ctx: &Ctx, name: &str) -> bool {
-    let unit = unit_name(name);
-    let out = run(ctx, &["systemctl", "--user", "show", "-p", "ActiveState", "-p", "ControlGroup", &unit], None, Some(15.0), false)
-        .unwrap_or_default();
-    let mut active = false;
-    for line in out.lines() {
-        if let Some(v) = line.strip_prefix("ActiveState=") {
-            active = v == "active";
-        } else if let Some(v) = line.strip_prefix("ControlGroup=")
-            && !v.is_empty()
-        {
-            ctx.cgroups.borrow_mut().insert(unit.clone(), v.to_string());
+/// What `systemctl show` told this process about a unit: its cgroup path
+/// (fixed by the unit name) and main pid (only a scan-order hint).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnitInfo {
+    pub cgroup: String,
+    pub main_pid: u32,
+}
+
+fn show(ctx: &Ctx, units: &[String]) -> Vec<(String, String, Option<UnitInfo>)> {
+    let mut argv: Vec<String> = ["systemctl", "--user", "show", "-p", "Id", "-p", "ActiveState", "-p", "ControlGroup", "-p", "MainPID"]
+        .map(String::from)
+        .to_vec();
+    argv.extend(units.iter().cloned());
+    let out = ctx.sys.run(ctx, &argv, None, Some(15.0), false).unwrap_or_default();
+    let mut blocks = Vec::new();
+    for block in out.split("\n\n") {
+        let (mut id, mut state, mut cg, mut pid) = (String::new(), String::new(), String::new(), 0u32);
+        for line in block.lines() {
+            match line.split_once('=') {
+                Some(("Id", v)) => id = v.to_string(),
+                Some(("ActiveState", v)) => state = v.to_string(),
+                Some(("ControlGroup", v)) => cg = v.to_string(),
+                Some(("MainPID", v)) => pid = v.parse().unwrap_or(0),
+                _ => {}
+            }
+        }
+        if !id.is_empty() {
+            let info = (!cg.is_empty()).then_some(UnitInfo { cgroup: cg, main_pid: pid });
+            blocks.push((id, state, info));
         }
     }
-    active
+    blocks
+}
+
+/// ActiveState of several units in one `systemctl show` (the Python runs
+/// `systemctl is-active` per unit). Cgroup and main pid are remembered for
+/// the ownership check later in this process.
+pub fn units_active(ctx: &Ctx, names: &[String]) -> Vec<bool> {
+    if names.is_empty() {
+        return vec![];
+    }
+    let units: Vec<String> = names.iter().map(|n| unit_name(n)).collect();
+    let blocks = show(ctx, &units);
+    for (id, _, info) in &blocks {
+        if let Some(info) = info {
+            ctx.units.borrow_mut().insert(id.clone(), info.clone());
+        }
+    }
+    units
+        .iter()
+        .map(|u| blocks.iter().any(|(id, state, _)| id == u && state == "active"))
+        .collect()
+}
+
+pub fn unit_active(ctx: &Ctx, name: &str) -> bool {
+    ctx.sys.units_active(ctx, &[name.to_string()]).first().copied().unwrap_or(false)
 }
 
 pub fn unit_cgroup(ctx: &Ctx, name: &str) -> Option<String> {
     let unit = unit_name(name);
-    if let Some(cg) = ctx.cgroups.borrow().get(&unit) {
-        return Some(cg.clone());
+    if let Some(info) = ctx.units.borrow().get(&unit) {
+        return Some(info.cgroup.clone());
     }
-    let out = run(ctx, &["systemctl", "--user", "show", "-P", "ControlGroup", &unit], None, Some(15.0), false).ok()?;
-    let cg = out.trim().to_string();
-    if cg.is_empty() {
-        return None;
-    }
-    ctx.cgroups.borrow_mut().insert(unit, cg.clone());
-    Some(cg)
+    let (_, _, info) = show(ctx, std::slice::from_ref(&unit)).into_iter().find(|(id, _, _)| *id == unit)?;
+    let info = info?;
+    ctx.units.borrow_mut().insert(unit, info.clone());
+    Some(info.cgroup)
 }
 
 pub fn agent_units(ctx: &Ctx, prefix: &str) -> Vec<String> {
