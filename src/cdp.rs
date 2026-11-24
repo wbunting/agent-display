@@ -163,6 +163,9 @@ pub trait CdpConn {
     fn call(&mut self, method: &str, params: Value, session: Option<&str>, timeout: Option<f64>) -> Result<Value>;
     fn wait_event(&mut self, method: &str, session: Option<&str>, timeout: Option<f64>) -> Result<Value>;
     fn close(&mut self);
+    /// Timeout for calls that don't pass one (a connection made for a quick
+    /// lookup is reused for page commands with the user's `--timeout`).
+    fn set_default_timeout(&mut self, _timeout: f64) {}
 }
 
 pub struct Cdp {
@@ -327,6 +330,9 @@ fn session_eq(ev: &Value, session: Option<&str>) -> bool {
 impl CdpConn for Cdp {
     fn port(&self) -> u16 {
         self.port
+    }
+    fn set_default_timeout(&mut self, timeout: f64) {
+        self.timeout = timeout;
     }
 
     fn send(&mut self, method: &str, params: Value, session: Option<&str>) -> Result<u64> {

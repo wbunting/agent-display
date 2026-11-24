@@ -8,6 +8,7 @@ use serde_json::{Map, Value};
 use crate::cdp::cdp_send;
 use crate::ctx::*;
 use crate::display::display;
+use crate::net::Owner;
 use crate::systemd::{agent_units, journal_tail, unit_name};
 use crate::util::{Result, resolve, unlink_missing_ok, write_private};
 use crate::{bail, json, tab};
@@ -103,17 +104,77 @@ pub fn browsers_real(ctx: &Ctx) -> Vec<BrowserInfo> {
             found.push((f, info));
         }
     }
-    let units: Vec<String> = found.iter().map(|(_, i)| i.unit().to_string()).collect();
-    let active = ctx.sys.units_active(ctx, &units);
-    let mut out = Vec::new();
-    for ((f, info), active) in found.into_iter().zip(active) {
-        if active {
-            out.push(info);
-        } else {
-            unlink_missing_ok(&f);
+    // A browser whose remembered CDP owner still checks out in /proc is
+    // running (a live process sits in its cgroup): no systemctl needed.
+    let (known, ask): (Vec<_>, Vec<_>) = found.into_iter().partition(|(_, i)| {
+        i.port().and_then(|p| u16::try_from(p).ok()).is_some_and(|p| owner_confirmed(ctx, p, i.unit()))
+    });
+    let units: Vec<String> = ask.iter().map(|(_, i)| i.unit().to_string()).collect();
+    let states = ctx.sys.units_active(ctx, &units);
+    let mut keep: Vec<(PathBuf, BrowserInfo)> = known;
+    for ((f, info), state) in ask.into_iter().zip(states) {
+        match state {
+            // Confirmed stopped: forget it.
+            Some(false) => {
+                unlink_missing_ok(&f);
+                unlink_missing_ok(&owner_path(ctx, info.unit()));
+            }
+            // Running, or unknown (systemctl failed or timed out, or the unit
+            // is starting/stopping): keep the registration. The ownership
+            // check decides whether it can be used now.
+            Some(true) | None => keep.push((f, info)),
         }
     }
-    out
+    keep.sort_by(|a, b| a.0.cmp(&b.0));
+    keep.into_iter().map(|(_, i)| i).collect()
+}
+
+/// `browsers/<unit>.owner`: who served the unit's CDP port when last
+/// checked (see `net::Owner`). Only a hint: it is re-proven from /proc
+/// before every use, and replaced by a full check when that fails.
+pub fn owner_path(ctx: &Ctx, unit: &str) -> PathBuf {
+    ctx.browsers_dir().join(format!("{unit}.owner"))
+}
+
+fn read_owner(ctx: &Ctx, unit: &str) -> Option<Owner> {
+    let text = std::fs::read_to_string(owner_path(ctx, unit)).ok()?;
+    Owner::from_json(&serde_json::from_str(&text).ok()?)
+}
+
+/// Best effort: the cache only saves work, so failures are ignored.
+fn write_owner(ctx: &Ctx, unit: &str, owner: &Owner) {
+    let dir = ctx.browsers_dir();
+    if !dir.is_dir() {
+        return;
+    }
+    let tmp = dir.join(format!(".{unit}.owner.{}", std::process::id()));
+    if write_private(&tmp, &json::dumps(&owner.to_json(), true)).is_ok() && std::fs::rename(&tmp, owner_path(ctx, unit)).is_err() {
+        unlink_missing_ok(&tmp);
+    }
+}
+
+/// The remembered owner of `unit`'s CDP on `port` still holds, per /proc.
+pub fn owner_confirmed(ctx: &Ctx, port: u16, unit: &str) -> bool {
+    read_owner(ctx, unit).is_some_and(|o| o.port == port && ctx.sys.owner_valid(&o, &unit_name(unit)))
+}
+
+/// Why the LISTEN socket on `port` isn't `unit`'s, or None if it is. The
+/// remembered owner is checked from /proc first; only when that fails does
+/// it ask systemd for the cgroup and scan it (and remember the result).
+pub fn listener_problem(ctx: &Ctx, port: u16, unit: &str) -> Option<String> {
+    if owner_confirmed(ctx, port, unit) {
+        return None;
+    }
+    match ctx.sys.listener_owner(ctx, port, &unit_name(unit)) {
+        Some(owner) => {
+            write_owner(ctx, unit, &owner);
+            None
+        }
+        None => {
+            unlink_missing_ok(&owner_path(ctx, unit));
+            Some(format!("CDP on port {port} is not served from {unit}"))
+        }
+    }
 }
 
 pub fn devtools_port(profile: &Path) -> Option<u16> {
@@ -126,9 +187,10 @@ pub fn devtools_port(profile: &Path) -> Option<u16> {
 /// be inside the browser unit AND answer CDP. The one ownership check used
 /// by readiness, `browser stop` and `tab`. Not running means no listener in
 /// the unit (no cgroup), so that fails at once without waiting on HTTP.
+/// See `listener_problem` for the /proc-first listener check.
 pub fn cdp_problem(ctx: &Ctx, port: u16, unit: &str, timeout: f64) -> Option<String> {
-    if !ctx.sys.listener_in_unit(ctx, port, &unit_name(unit)) {
-        return Some(format!("CDP on port {port} is not served from {unit}"));
+    if let Some(problem) = listener_problem(ctx, port, unit) {
+        return Some(problem);
     }
     if let Err(e) = ctx.sys.cdp_version(port, timeout) {
         return Some(format!("{unit} is not answering CDP on {port}: {e}"));
@@ -297,6 +359,7 @@ pub fn close_browsers(ctx: &Ctx, units: &[String]) -> Result<()> {
             close_browser(ctx, unit, port, 10.0)?;
         }
         unlink_missing_ok(&ctx.browsers_dir().join(format!("{unit}.json")));
+        unlink_missing_ok(&owner_path(ctx, unit));
     }
     Ok(())
 }

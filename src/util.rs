@@ -16,14 +16,41 @@ use std::time::{Duration, Instant};
 pub struct Error {
     pub msg: String,
     pub os: bool,
+    /// Process exit status for this error (see `exit`).
+    pub code: i32,
+}
+
+/// Exit statuses shared by the `tab` commands. Agents branch on these, so
+/// they are a contract: never reuse a number for another meaning.
+pub mod exit {
+    /// Any other failure (refusals, bad input, CDP errors).
+    pub const ERROR: i32 = 1;
+    /// Command line usage error (argparse).
+    pub const USAGE: i32 = 2;
+    /// A wait ran out of time (`tab wait`, `tab show --timeout`).
+    pub const TIMEOUT: i32 = 3;
+    /// The tab is gone: closed or crashed, confirmed twice ~250 ms apart.
+    pub const GONE: i32 = 4;
+    /// The browser holding the tab is not running.
+    pub const BROWSER_DOWN: i32 = 5;
+    /// Read-back after an input action did not match (`tab type`).
+    pub const MISMATCH: i32 = 6;
+    /// No definitive answer (browser stalled, lookup failed after internal
+    /// retries): try again later. EX_TEMPFAIL.
+    pub const TEMPFAIL: i32 = 75;
 }
 
 impl Error {
     pub fn new(msg: impl Into<String>) -> Self {
-        Error { msg: msg.into(), os: false }
+        Error { msg: msg.into(), os: false, code: exit::ERROR }
     }
     pub fn os(msg: impl Into<String>) -> Self {
-        Error { msg: msg.into(), os: true }
+        Error { msg: msg.into(), os: true, code: exit::ERROR }
+    }
+    /// Same error with another exit status.
+    pub fn with_code(mut self, code: i32) -> Self {
+        self.code = code;
+        self
     }
     pub fn is_timeout(&self) -> bool {
         self.msg.contains("timed out")

@@ -27,6 +27,8 @@ bench-trace = []
 serde_json = { version = "1", features = ["preserve_order"] }
 # memfd_create, sendmsg(SCM_RIGHTS), poll, flock, umask, pidfd_open, getuid.
 libc = "0.2"
+# `tab show --until-url REGEX`: small, no Unicode tables.
+regex-lite = "0.1"
 
 [profile.release]
 opt-level = 3

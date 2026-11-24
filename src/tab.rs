@@ -10,6 +10,15 @@
 //! output is always on screen. Outputs are created per `tab open` and
 //! unplugged once their window is gone. Each is marked with a file in
 //! tab-outputs/ named after the output, holding the tab id.
+//!
+//! Tabs are looked up by id with `Target.getTargetInfo` on the browser
+//! endpoint, never by scanning `/json/list`: Chromium leaves a page out of
+//! that list while its main frame is being swapped (cross-site navigation,
+//! prerender activation) or while it is briefly not in a tab strip, which
+//! made a live tab look closed. A lookup ends in one of: found; gone (exit
+//! 4, only after two definitive "no such target" answers ~250 ms apart from
+//! every running browser); browser down (exit 5); or no definitive answer
+//! after internal retries (exit 75). It never guesses "closed".
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
@@ -20,12 +29,12 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
 
-use crate::browser::{OWNERSHIP_TIMEOUT, cdp_problem};
+use crate::browser::{OWNERSHIP_TIMEOUT, cdp_problem, listener_problem};
 use crate::cdp::CdpConn;
 use crate::cli::TabOpts;
 use crate::ctx::*;
 use crate::display::{display, ensure_runtime_dir, walk, windows};
-use crate::util::{Error, Result, absolute, b64decode, fmt_g, hex, py_repr, random_bytes, unlink_missing_ok, write_private};
+use crate::util::{Error, Result, absolute, b64decode, exit, fmt_g, hex, py_repr, random_bytes, unlink_missing_ok, write_private};
 use crate::{bail, json};
 
 /// `/json/list` timeout. Raised with the ownership check (5 s in the
@@ -37,6 +46,15 @@ pub const TARGETS_TIMEOUT: f64 = 15.0;
 pub const WINDOW_POLL: f64 = 0.005;
 /// `tab close` attempts while the browser unit stays active (fix 1).
 pub const CLOSE_ATTEMPTS: u32 = 3;
+/// A lookup with no definitive answer is retried within this budget
+/// (seconds), after LOOKUP_BACKOFF pauses: it rides out the stalls the
+/// shared browser has under host load (as the 15 s ownership timeout did).
+pub const LOOKUP_BUDGET: f64 = 15.0;
+/// Per-step timeout (CDP connect, getTargetInfo) of one lookup attempt.
+pub const LOOKUP_STEP_TIMEOUT: f64 = 5.0;
+pub const LOOKUP_BACKOFF: &[f64] = &[0.5, 1.0, 2.0, 4.0];
+/// Pause before asking again whether a tab that looked gone really is.
+pub const GONE_RECHECK: f64 = 0.25;
 
 pub fn valid_tab_id(tab: &str) -> bool {
     (8..=64).contains(&tab.len()) && tab.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
@@ -83,6 +101,13 @@ pub fn tab_port(ctx: &Ctx, port: Option<i64>) -> Result<u16> {
         let unit = owned.iter().find(|(p, _)| *p == port).map(|(_, u)| u.clone());
         match unit {
             Some(u) if reserved_reason(port).is_none() => return check_owned(ctx, port, &u),
+            // Nothing registered and nothing listening: that browser is gone
+            // (stopped or crashed), not someone else's port.
+            None if reserved_reason(port).is_none()
+                && u16::try_from(port).is_ok_and(|p| p >= 1024 && ctx.sys.port_free(p)) =>
+            {
+                return Err(browser_down(&format!("no agent-display browser on port {port} (stopped?)")));
+            }
             _ => bail!("port {port} is not an agent-display browser (see `agent-display browser list`); refusing"),
         }
     }
@@ -91,9 +116,13 @@ pub fn tab_port(ctx: &Ctx, port: Option<i64>) -> Result<u16> {
     }
     match owned.len() {
         1 => check_owned(ctx, owned[0].0, &owned[0].1),
-        0 => bail!("no agent-display browser is running; start one with `agent-display browser start`"),
+        0 => Err(browser_down("no agent-display browser is running; start one with `agent-display browser start`")),
         _ => bail!("several agent browsers are running; pass --port"),
     }
+}
+
+fn browser_down(msg: &str) -> Error {
+    Error::new(msg).with_code(exit::BROWSER_DOWN)
 }
 
 fn str_of(v: Option<&Value>) -> String {
@@ -104,56 +133,184 @@ fn str_of(v: Option<&Value>) -> String {
     }
 }
 
-/// (port, target) for TAB in an agent-display browser, or Error.
-pub fn find_tab(ctx: &Ctx, tab: &str, port: Option<i64>) -> Result<(u16, Value)> {
+/// A tab found by id: its browser's port, `Target.getTargetInfo`'s
+/// `targetInfo`, and the open browser connection it was found on.
+pub struct Found {
+    pub port: u16,
+    pub info: Value,
+    pub cdp: Box<dyn CdpConn>,
+}
+
+/// One browser's answer about a tab id.
+enum Probe {
+    Found(Value, Box<dyn CdpConn>),
+    /// Definitive: the browser answered and has no such target.
+    Missing,
+    /// No answer we can trust (stalled, not ready, connection failed).
+    Unavailable(String),
+}
+
+fn no_such_target(e: &Error) -> bool {
+    e.msg.contains("No target with given id")
+}
+
+/// Ask the browser on `port` (`unit`) for `tab` by id. Chromium creates
+/// DevTools hosts lazily, so a miss is repeated after `Target.getTargets`
+/// (which creates hosts for every live frame) before it counts.
+fn probe(ctx: &Ctx, port: u16, unit: &str, tab: &str, step: f64) -> Probe {
+    if let Some(problem) = listener_problem(ctx, port, unit) {
+        return Probe::Unavailable(problem);
+    }
+    let mut cdp = match ctx.sys.cdp_connect(ctx, port, step) {
+        Ok(c) => c,
+        Err(e) => return Probe::Unavailable(format!("{unit} is not answering CDP on {port}: {}", cdp_text(&e))),
+    };
+    let ask = |cdp: &mut Box<dyn CdpConn>| cdp.call("Target.getTargetInfo", json!({"targetId": tab}), None, Some(step));
+    let mut r = ask(&mut cdp);
+    if r.as_ref().is_err_and(no_such_target) && cdp.call("Target.getTargets", json!({}), None, Some(step)).is_ok() {
+        r = ask(&mut cdp);
+    }
+    match r {
+        Ok(v) => match v.get("targetInfo") {
+            Some(info) if info.is_object() => Probe::Found(info.clone(), cdp),
+            _ => Probe::Unavailable(format!("{unit}: Target.getTargetInfo: no targetInfo")),
+        },
+        Err(e) if no_such_target(&e) => {
+            cdp.close();
+            Probe::Missing
+        }
+        Err(e) => {
+            cdp.close();
+            Probe::Unavailable(format!("{unit} on {port}: {}", cdp_text(&e)))
+        }
+    }
+}
+
+/// One pass over the candidate browsers.
+enum Scan {
+    Found(Found),
+    /// Every running candidate said "no such target".
+    Missing,
+    Unavailable(Vec<String>),
+    /// No browser registered (or the given one isn't).
+    NoBrowser,
+}
+
+fn candidates(ctx: &Ctx, port: Option<i64>) -> Vec<(u16, String)> {
+    let mut v: Vec<(u16, String)> = owned_ports(ctx)
+        .into_iter()
+        .filter(|(p, _)| port.is_none_or(|q| q == *p))
+        .filter_map(|(p, u)| u16::try_from(p).ok().map(|p| (p, u)))
+        .collect();
+    v.sort();
+    v
+}
+
+fn scan(ctx: &Ctx, tab: &str, port: Option<i64>, step: f64) -> Scan {
+    let cands = candidates(ctx, port);
+    if cands.is_empty() {
+        return Scan::NoBrowser;
+    }
+    let mut problems = Vec::new();
+    for (p, unit) in cands {
+        match probe(ctx, p, &unit, tab, step) {
+            Probe::Found(info, cdp) => return Scan::Found(Found { port: p, info, cdp }),
+            Probe::Missing => {}
+            Probe::Unavailable(why) => problems.push(format!("{p} ({why})")),
+        }
+    }
+    if problems.is_empty() { Scan::Missing } else { Scan::Unavailable(problems) }
+}
+
+/// Is TAB still in a running agent-display browser? `Some(false)` only on
+/// two definitive misses ~250 ms apart (or no browser running); `None` when
+/// a browser didn't answer. One pass, no retries: for cleanup decisions.
+pub fn tab_alive(ctx: &Ctx, tab: &str) -> Option<bool> {
+    for pass in 0..2 {
+        match scan(ctx, tab, None, LOOKUP_STEP_TIMEOUT) {
+            Scan::Found(mut f) => {
+                f.cdp.close();
+                return Some(true);
+            }
+            Scan::NoBrowser => return Some(false),
+            Scan::Unavailable(_) => return None,
+            Scan::Missing if pass == 0 => ctx.sys.sleep(GONE_RECHECK),
+            Scan::Missing => {}
+        }
+    }
+    Some(false)
+}
+
+/// Find TAB in the agent-display browsers (or the one on `port`). Errors
+/// carry the exit status: 4 gone (confirmed twice), 5 browser down, 75 no
+/// definitive answer within LOOKUP_BUDGET, 1 for refusals and non-tabs.
+pub fn lookup(ctx: &Ctx, tab: &str, port: Option<i64>) -> Result<Found> {
     if !valid_tab_id(tab) {
         bail!("invalid tab id {}", py_repr(tab));
     }
-    let owned = owned_ports(ctx);
-    let ports: Vec<i64> = match port {
-        Some(p) => {
-            tab_port(ctx, Some(p))?;
-            vec![p]
-        }
-        None => {
-            let mut v: Vec<i64> = owned.iter().map(|(p, _)| *p).collect();
-            v.sort();
-            v
-        }
-    };
-    let mut skipped = Vec::new();
-    for p in ports {
-        let attempt = (|| -> Result<(u16, Vec<Value>)> {
-            let p16 = if port.is_none() {
-                let unit = owned.iter().find(|(q, _)| *q == p).map(|(_, u)| u.clone()).unwrap_or_default();
-                check_owned(ctx, p, &unit)?
-            } else {
-                p as u16
-            };
-            Ok((p16, ctx.sys.cdp_targets(p16, TARGETS_TIMEOUT)?))
-        })();
-        let (p16, targets) = match attempt {
-            Ok(x) => x,
-            Err(e) if port.is_none() => {
-                // Another agent's browser may be starting or hung; it must
-                // not break lookups of tabs in the healthy ones.
-                skipped.push(format!("{p} ({e})"));
-                continue;
-            }
-            Err(e) => return Err(e),
-        };
-        for t in targets {
-            if t.get("id").and_then(Value::as_str) == Some(tab) {
-                let kind = str_of(t.get("type"));
+    if let Some(p) = port {
+        // Refusals (foreign, reserved, hijacked port) and a stopped browser
+        // are definitive: no retries.
+        tab_port(ctx, Some(p))?;
+    }
+    let deadline = Instant::now() + Duration::from_secs_f64(LOOKUP_BUDGET);
+    let mut tries = 0usize;
+    let mut missed_once = false;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now()).as_secs_f64();
+        match scan(ctx, tab, port, left.clamp(1.0, LOOKUP_STEP_TIMEOUT)) {
+            Scan::Found(f) => {
+                let kind = str_of(f.info.get("type"));
                 if kind != "page" {
+                    let mut cdp = f.cdp;
+                    cdp.close();
                     bail!("{tab} is a {kind}, not a tab");
                 }
-                return Ok((p16, t));
+                return Ok(f);
+            }
+            Scan::NoBrowser => {
+                let msg = match port {
+                    Some(p) => format!("no agent-display browser on port {p} (stopped?); tab {tab} went with it"),
+                    None => format!("no agent-display browser is running; tab {tab} went with it"),
+                };
+                return Err(browser_down(&msg));
+            }
+            Scan::Missing if missed_once => {
+                return Err(Error::new(format!(
+                    "no tab {tab} in an agent-display browser: it was closed or crashed (checked twice)"
+                ))
+                .with_code(exit::GONE));
+            }
+            Scan::Missing => {
+                missed_once = true;
+                ctx.sys.sleep(GONE_RECHECK);
+            }
+            Scan::Unavailable(problems) => {
+                missed_once = false;
+                let pause = LOOKUP_BACKOFF.get(tries).copied();
+                tries += 1;
+                let left = deadline.saturating_duration_since(Instant::now()).as_secs_f64();
+                match pause {
+                    Some(pause) if pause < left => ctx.sys.sleep(pause),
+                    _ => {
+                        return Err(Error::new(format!(
+                            "tab {tab}: no definitive answer after {tries} attempts (browser busy or restarting); \
+                             try again: {}",
+                            problems.join(", ")
+                        ))
+                        .with_code(exit::TEMPFAIL));
+                    }
+                }
             }
         }
     }
-    let extra = if skipped.is_empty() { String::new() } else { format!("; skipped unhealthy browsers: {}", skipped.join(", ")) };
-    bail!("no tab {tab} in an agent-display browser (closed?){extra}");
+}
+
+/// (port, targetInfo) for TAB; see `lookup`.
+pub fn find_tab(ctx: &Ctx, tab: &str, port: Option<i64>) -> Result<(u16, Value)> {
+    let mut f = lookup(ctx, tab, port)?;
+    f.cdp.close();
+    Ok((f.port, f.info))
 }
 
 /// `timeout or default`, as the Python's falsy check does.
@@ -176,8 +333,8 @@ pub struct Tab<'a, 'c> {
 
 impl<'a, 'c> Tab<'a, 'c> {
     pub fn open(ctx: &'a Ctx<'c>, tab: &str, port: Option<i64>, timeout: f64) -> Result<Tab<'a, 'c>> {
-        let (port, _) = find_tab(ctx, tab, port)?;
-        let mut cdp = ctx.sys.cdp_connect(ctx, port, timeout)?;
+        let Found { port, mut cdp, .. } = lookup(ctx, tab, port)?;
+        cdp.set_default_timeout(timeout);
         let session = match cdp.call("Target.attachToTarget", json!({"targetId": tab, "flatten": true}), None, None) {
             Ok(r) => r.get("sessionId").and_then(Value::as_str).map(String::from),
             Err(e) => {
@@ -426,24 +583,52 @@ pub fn marked_outputs(ctx: &Ctx) -> BTreeMap<String, String> {
 }
 
 /// Unplug tab outputs whose window is gone. Call with OutputsLock held.
-/// Only marked `HEADLESS-N` outputs other than HEADLESS-1, and only empty.
+/// Only marked `HEADLESS-N` outputs other than HEADLESS-1, only empty, and
+/// only once the marked tab is confirmed gone (`tab_alive`): an output that
+/// is briefly empty while its live tab's window is remapped (fullscreen, a
+/// dialog, a crashed GPU surface) stays. Its viewer (`tab show`) goes too.
 pub fn gc_tab_outputs(ctx: &Ctx, disp: &Disp) -> Result<Vec<String>> {
+    gc_outputs(ctx, disp, None)
+}
+
+/// `gc_tab_outputs`, knowing that tab `closed` was just closed (no need to
+/// ask the browser about it).
+fn gc_outputs(ctx: &Ctx, disp: &Disp, closed: Option<&str>) -> Result<Vec<String>> {
     let counts = output_windows(ctx, disp)?;
     let mut removed = Vec::new();
-    for name in marked_outputs(ctx).keys() {
-        match counts.get(name) {
-            None => unlink_missing_ok(&ctx.tab_outputs_dir().join(name)),
+    for (name, tab) in marked_outputs(ctx) {
+        match counts.get(&name) {
+            None => {
+                crate::show::stop_viewer(ctx, &name);
+                unlink_missing_ok(&ctx.tab_outputs_dir().join(&name));
+            }
             Some(0) => {
+                // "pending": its `tab open` died before creating the tab
+                // (markers are only pending while the lock is held).
+                let gone = tab == "pending" || closed == Some(tab.as_str()) || tab_alive(ctx, &tab) == Some(false);
+                if !gone {
+                    continue;
+                }
+                crate::show::stop_viewer(ctx, &name);
                 if ctx.sys.sway_cmd(disp, &format!("output {name} unplug")).is_err() {
                     continue;
                 }
-                unlink_missing_ok(&ctx.tab_outputs_dir().join(name));
-                removed.push(name.clone());
+                unlink_missing_ok(&ctx.tab_outputs_dir().join(&name));
+                removed.push(name);
             }
             Some(_) => {}
         }
     }
     Ok(removed)
+}
+
+/// Unplug our own new output while it is still empty (with the lock held),
+/// e.g. when the tab's window never showed up.
+fn drop_own_output(ctx: &Ctx, disp: &Disp, name: &str) {
+    let empty = output_windows(ctx, disp).ok().is_some_and(|c| c.get(name).copied().unwrap_or(0) == 0);
+    if empty && ctx.sys.sway_cmd(disp, &format!("output {name} unplug")).is_ok() {
+        unlink_missing_ok(&ctx.tab_outputs_dir().join(name));
+    }
 }
 
 pub fn find_window_real(ctx: &Ctx, disp: &Disp, title: &str, timeout: f64) -> Option<Window> {
@@ -533,16 +718,17 @@ pub fn create_tab_window(ctx: &Ctx, cdp: &mut dyn CdpConn) -> Result<(String, Op
         }
         Ok(())
     })();
-    if made.is_err() {
-        if output.is_some() {
-            let _ = gc_tab_outputs(ctx, &disp); // still empty: unplug it now
-        }
-        output = None;
+    if made.is_err()
+        && let Some(o) = output.take()
+    {
+        drop_own_output(ctx, &disp, &o); // still empty: unplug it now
     }
     let tab = match create_target(ctx, cdp, params, &nonce, 30.0) {
         Ok(t) => t,
         Err(e) => {
-            let _ = gc_tab_outputs(ctx, &disp); // our output is still empty: unplug it
+            if let Some(o) = &output {
+                drop_own_output(ctx, &disp, o); // still empty: unplug it now
+            }
             return Err(e);
         }
     };
@@ -550,15 +736,12 @@ pub fn create_tab_window(ctx: &Ctx, cdp: &mut dyn CdpConn) -> Result<(String, Op
         write_private(&ctx.tab_outputs_dir().join(o), &tab)?;
     }
     let win = ctx.sys.find_window(ctx, &disp, &title, 10.0);
-    match &win {
-        None => output = None, // never placed; left empty, the next gc removes it
-        Some(w) => {
-            if let Some(o) = &output
-                && ctx.sys.sway_cmd(&disp, &format!("[con_id={}] move container to output {o}", w.id)).is_err()
-            {
-                output = None; // left empty: the next gc removes it
-            }
-        }
+    let placed = match (&win, &output) {
+        (Some(w), Some(o)) => ctx.sys.sway_cmd(&disp, &format!("[con_id={}] move container to output {o}", w.id)).is_ok(),
+        _ => false,
+    };
+    if !placed && let Some(o) = output.take() {
+        drop_own_output(ctx, &disp, &o); // never used: don't leave it around
     }
     // sway focuses new windows: give the seat back (another agent may be
     // typing with OS input). With nothing focused before, at least keep the
@@ -593,7 +776,7 @@ pub fn remove_tab_output(ctx: &Ctx, tab: &str, timeout: f64) -> Option<String> {
         ctx.sys.sleep(WINDOW_POLL);
     }
     let _lock = OutputsLock::acquire(ctx).ok()?;
-    gc_tab_outputs(ctx, &disp).ok()?.contains(&output).then_some(output)
+    gc_outputs(ctx, &disp, Some(tab)).ok()?.contains(&output).then_some(output)
 }
 
 // ------------------------------------------------------------ commands
@@ -674,8 +857,7 @@ pub fn cmd_tab_info(ctx: &Ctx, o: &TabOpts, tab: &str) -> Result<i32> {
 }
 
 /// Worth another `tab close` attempt: the browser was slow or the
-/// connection broke (also when the lookup skipped a browser for that), not
-/// an ownership refusal or a missing tab.
+/// connection broke, not a refusal or a missing tab.
 fn retryable(e: &Error) -> bool {
     e.os || e.is_timeout() || e.msg.contains("is not answering CDP") || e.msg.contains("CDP closed")
 }
@@ -687,40 +869,33 @@ fn unit_for_port(ctx: &Ctx, port: u16) -> Option<String> {
 /// `tab close`, retried (fix 1): under host load the shared browser can
 /// stall for seconds, and a failed close used to leave the tab open.
 /// Retries only while the tab's browser unit is still active, so a stopped
-/// browser still fails at once. If an earlier attempt sent closeTarget and
-/// the tab is now gone, that attempt closed it.
+/// browser fails at once (exit 5). If an earlier attempt sent closeTarget
+/// and the tab is now confirmed gone, that attempt closed it. A close that
+/// keeps stalling exits 75; a tab that was already gone exits 4.
 pub fn cmd_tab_close(ctx: &Ctx, o: &TabOpts, tab: &str) -> Result<i32> {
-    let mut found_on: Option<u16> = None;
+    let mut sent_on: Option<u16> = None;
     let mut attempt = 0;
     let port = loop {
         attempt += 1;
-        let r = (|| -> Result<u16> {
-            let (port, _) = find_tab(ctx, tab, o.port_raw)?;
-            found_on = Some(port);
-            let ok = close_target(ctx, port, tab)?;
-            if ok.get("success") == Some(&Value::Bool(false)) {
-                bail!("could not close {tab}");
-            }
-            Ok(port)
-        })();
+        let mut found = match lookup(ctx, tab, o.port_raw) {
+            Ok(f) => f,
+            Err(e) if e.code == exit::GONE && sent_on.is_some() => break sent_on.unwrap_or_default(),
+            Err(e) => return Err(e),
+        };
+        sent_on = Some(found.port);
+        let r = found.cdp.call("Target.closeTarget", json!({"targetId": tab}), None, Some(10.0));
+        found.cdp.close();
         match r {
-            Ok(port) => break port,
+            Ok(ok) if ok.get("success") == Some(&Value::Bool(false)) => bail!("could not close {tab}"),
+            Ok(_) => break found.port,
+            Err(e) if !retryable(&e) => return Err(e),
             Err(e) => {
-                if let Some(port) = found_on
-                    && e.msg.starts_with(&format!("no tab {tab} in an agent-display browser"))
-                    && !e.msg.contains("skipped unhealthy")
-                {
-                    break port; // the earlier closeTarget went through
+                let unit = unit_for_port(ctx, found.port);
+                if !unit.is_some_and(|u| ctx.sys.unit_active(ctx, &u)) {
+                    return Err(e.with_code(exit::BROWSER_DOWN));
                 }
-                if attempt >= CLOSE_ATTEMPTS || !retryable(&e) {
-                    return Err(e);
-                }
-                let units: Vec<String> = match found_on {
-                    Some(p) => unit_for_port(ctx, p).into_iter().collect(),
-                    None => owned_ports(ctx).into_iter().map(|(_, u)| u).collect(),
-                };
-                if !units.iter().any(|u| ctx.sys.unit_active(ctx, u)) {
-                    return Err(e);
+                if attempt >= CLOSE_ATTEMPTS {
+                    return Err(e.with_code(exit::TEMPFAIL));
                 }
                 ctx.sys.sleep(attempt as f64);
             }

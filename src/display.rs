@@ -285,9 +285,10 @@ pub fn cmd_stop(ctx: &Ctx) -> Result<i32> {
         unlink_missing_ok(&rt.join(name));
     }
     let _ = std::fs::remove_dir_all(ctx.tab_outputs_dir());
+    let _ = std::fs::remove_dir_all(ctx.vnc_dir());
     if let Ok(rd) = std::fs::read_dir(ctx.browsers_dir()) {
         for e in rd.flatten() {
-            if e.path().extension().is_some_and(|x| x == "json") {
+            if e.path().extension().is_some_and(|x| x == "json" || x == "owner") {
                 unlink_missing_ok(&e.path());
             }
         }
@@ -536,7 +537,7 @@ pub fn cmd_hold_input(ctx: &Ctx) -> Result<i32> {
 
 // ------------------------------------------------------------ viewer
 
-pub fn cmd_view(ctx: &Ctx, mut port: i64, view_only: bool) -> Result<i32> {
+pub fn cmd_view(ctx: &Ctx, mut port: i64, view_only: bool, exit_on_disconnect: bool) -> Result<i32> {
     require(ctx, &["wayvnc"])?;
     let disp = display(ctx)?;
     let port_file = ctx.runtime_dir().join("vnc.port");
@@ -559,6 +560,9 @@ pub fn cmd_view(ctx: &Ctx, mut port: i64, view_only: bool) -> Result<i32> {
         argv.push(which("wayvnc", &ctx.env).unwrap().to_string_lossy().into());
         if view_only {
             argv.push("--disable-input".into());
+        }
+        if exit_on_disconnect {
+            argv.push("--exit-on-disconnect".into());
         }
         argv.extend([
             format!("--config={}", rt.join("wayvnc.config").display()),
@@ -583,6 +587,9 @@ pub fn cmd_view(ctx: &Ctx, mut port: i64, view_only: bool) -> Result<i32> {
     ctx.println(&format!(
         "VNC on 127.0.0.1:{port} (loopback only). Will can run:\n  vncviewer 127.0.0.1::{port}\nStop with: agent-display unview"
     ));
+    if exit_on_disconnect {
+        ctx.println("It stops by itself when the last viewer disconnects (if it was started with --exit-on-disconnect).");
+    }
     Ok(0)
 }
 

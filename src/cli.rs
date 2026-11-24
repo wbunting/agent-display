@@ -1,7 +1,8 @@
 //! Command line, parsed the way the Python's argparse parser does it, so
 //! flags, positionals, abbreviations, `--`, usage errors (exit 2) and `-h`
-//! behave and print the same. Usage/help texts are generated from the
-//! Python parser (`tools/gen_cli_text.py`).
+//! behave and print the same. Usage/help texts live in `cli_text.rs`
+//! (argparse's format; generated from the Python parser at the port, edited
+//! by hand since: a test checks each parser here has a matching entry).
 
 use std::collections::{HashMap, HashSet};
 
@@ -261,15 +262,37 @@ fn build() -> Parser {
     let ti = tab_cmd(&tb, "info", true);
     let tc = tab_cmd(&tb, "close", true);
     let tl = tab_cmd(&tb, "list", false);
+    // show: --timeout is how long the view may stay up, not a CDP step.
+    let mut tsw = tb.child("show");
+    tsw.opt("--port", "port", Ty::Int, Val::None);
+    tsw.opt("--timeout", "show_timeout", Ty::Float, Val::Float(900.0));
+    tsw.flag("--view-only", "view_only");
+    tsw.opt("--until-url", "until_url", Ty::Str, Val::None);
+    tsw.flag("--until-closed", "until_closed");
+    tsw.flag("--wait-viewer", "wait_viewer");
+    tsw.pos("tab", Nargs::One, Ty::Str, Val::None);
+    let mut tus = tb.child("unshow");
+    tus.pos("tab", Nargs::One, Ty::Str, Val::None);
     tb.sub(
         "tab_command",
-        vec![("open", to), ("goto", tg), ("eval", te), ("shot", tsh), ("info", ti), ("close", tc), ("list", tl)],
+        vec![
+            ("open", to),
+            ("goto", tg),
+            ("eval", te),
+            ("shot", tsh),
+            ("info", ti),
+            ("close", tc),
+            ("list", tl),
+            ("show", tsw),
+            ("unshow", tus),
+        ],
     );
     subs.push(("tab", tb));
 
     let mut v = c("view");
     v.opt("--port", "port", Ty::Int, Val::Int(5910));
     v.flag("--view-only", "view_only");
+    v.flag("--exit-on-disconnect", "exit_on_disconnect");
     subs.push(("view", v));
     subs.push(("unview", c("unview")));
     subs.push(("hold-input", c("hold-input")));
@@ -736,6 +759,17 @@ pub struct TabOpts {
     pub timeout: f64,
 }
 
+/// `tab show` options (see show.rs).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShowOpts {
+    pub view_only: bool,
+    pub until_url: Option<String>,
+    pub until_closed: bool,
+    pub wait_viewer: bool,
+    /// Seconds the view may stay up.
+    pub timeout: f64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Cmd {
     Check,
@@ -763,7 +797,9 @@ pub enum Cmd {
     TabInfo { o: TabOpts, tab: String },
     TabClose { o: TabOpts, tab: String },
     TabList { o: TabOpts },
-    View { port: i64, view_only: bool },
+    TabShow { o: TabOpts, tab: String, show: ShowOpts },
+    TabUnshow { tab: String },
+    View { port: i64, view_only: bool, exit_on_disconnect: bool },
     Unview,
     HoldInput,
 }
@@ -858,10 +894,29 @@ pub fn parse(argv: &[String]) -> Result<Cmd, Exit> {
                 "shot" => Cmd::TabShot { o, tab: s(&ns, "tab"), path: s(&ns, "path"), full_page: b(&ns, "full_page") },
                 "info" => Cmd::TabInfo { o, tab: s(&ns, "tab") },
                 "close" => Cmd::TabClose { o, tab: s(&ns, "tab") },
+                "show" => Cmd::TabShow {
+                    o,
+                    tab: s(&ns, "tab"),
+                    show: ShowOpts {
+                        view_only: b(&ns, "view_only"),
+                        until_url: os_(&ns, "until_url"),
+                        until_closed: b(&ns, "until_closed"),
+                        wait_viewer: b(&ns, "wait_viewer"),
+                        timeout: match ns.get("show_timeout") {
+                            Some(Val::Float(f)) => *f,
+                            _ => 900.0,
+                        },
+                    },
+                },
+                "unshow" => Cmd::TabUnshow { tab: s(&ns, "tab") },
                 _ => Cmd::TabList { o },
             }
         }
-        "view" => Cmd::View { port: i(&ns, "port").unwrap_or(5910), view_only: b(&ns, "view_only") },
+        "view" => Cmd::View {
+            port: i(&ns, "port").unwrap_or(5910),
+            view_only: b(&ns, "view_only"),
+            exit_on_disconnect: b(&ns, "exit_on_disconnect"),
+        },
         "unview" => Cmd::Unview,
         _ => Cmd::HoldInput,
     })
@@ -944,6 +999,82 @@ mod tests {
         }
         let full = p("tab|goto").unwrap_err().stderr;
         assert!(full.starts_with("usage: agent-display tab goto [-h] [--port PORT] [--timeout TIMEOUT]\n"));
+    }
+
+    #[test]
+    fn tab_show_and_unshow_parse() {
+        let show = |view_only, until_url: Option<&str>, until_closed, wait_viewer, timeout| ShowOpts {
+            view_only,
+            until_url: until_url.map(String::from),
+            until_closed,
+            wait_viewer,
+            timeout,
+        };
+        assert_eq!(p("tab|show|T").unwrap(), Cmd::TabShow { o: o(), tab: "T".into(), show: show(false, None, false, false, 900.0) });
+        assert_eq!(
+            p("tab|show|--view-only|--until-url|^https://x/home|--until-closed|--wait-viewer|--timeout|60|T").unwrap(),
+            Cmd::TabShow { o: o(), tab: "T".into(), show: show(true, Some("^https://x/home"), true, true, 60.0) }
+        );
+        // --timeout is the view's lifetime; CDP steps keep their default.
+        let Cmd::TabShow { o: opts, .. } = p("tab|show|--port|9425|--timeout|5|T").unwrap() else { panic!() };
+        assert_eq!((opts.port, opts.timeout), (Some(9425), 30.0));
+        assert_eq!(p("tab|unshow|T").unwrap(), Cmd::TabUnshow { tab: "T".into() });
+        assert_eq!(p("view|--exit-on-disconnect").unwrap(), Cmd::View { port: 5910, view_only: false, exit_on_disconnect: true });
+        assert_eq!(err("tab|show"), "agent-display tab show: error: the following arguments are required: tab");
+        assert_eq!(err("tab|unshow|--port|1|T"), "agent-display: error: unrecognized arguments: --port T");
+        assert_eq!(err("tab|show|T|--timeout|x"), "agent-display tab show: error: argument --timeout: invalid float value: 'x'");
+    }
+
+    #[test]
+    fn new_help_texts() {
+        let h = |s: &str| {
+            let e = p(s).unwrap_err();
+            assert_eq!(e.code, 0, "{s}");
+            e.stdout
+        };
+        let tab = h("tab|-h");
+        assert!(tab.starts_with("usage: agent-display tab [-h]\n                         {open,goto,eval,shot,info,close,list,show,unshow} ...\n"));
+        assert!(tab.contains("    show                let a human see and use this tab's window over VNC\n"));
+        assert!(tab.contains("  4   tab gone: closed or crashed (checked twice, ~250 ms apart)\n"));
+        assert!(tab.contains("  75  no definitive answer (browser stalled or restarting): try again\n"));
+        let show = h("tab|show|--help");
+        assert!(show.starts_with("usage: agent-display tab show [-h] [--port PORT] [--timeout SECONDS]\n"));
+        assert!(show.contains("  --until-url REGEX  end the view once the tab's URL matches REGEX"));
+        assert!(h("tab|unshow|-h").starts_with("usage: agent-display tab unshow [-h] tab\n"));
+        assert!(h("view|-h").contains("  --exit-on-disconnect  stop the viewer when the last client disconnects\n"));
+        // Usage errors print the subcommand's own usage.
+        assert!(p("tab|show").unwrap_err().stderr.starts_with("usage: agent-display tab show [-h] [--port PORT]"));
+    }
+
+    /// cli_text.rs is maintained by hand now: every parser must have an
+    /// entry whose usage names all its options, positionals and subcommands.
+    #[test]
+    fn every_parser_has_matching_help_text() {
+        fn walk(p: &Parser, n: &mut usize) {
+            *n += 1;
+            let (usage, help) = texts(&p.prog);
+            assert!(!usage.is_empty() && !help.is_empty(), "no cli_text entry for {:?}", p.prog);
+            assert!(usage.starts_with(&format!("usage: {} [-h]", p.prog)), "{usage}");
+            assert!(help.starts_with(usage), "{}: help must start with usage", p.prog);
+            let flat = usage.split_whitespace().collect::<Vec<_>>().join(" ");
+            for a in &p.args {
+                // argparse's usage names an option by its first string.
+                if let Some(s) = a.strings.first() {
+                    assert!(flat.contains(&format!("[{s}")) || flat.contains(&format!("| {s}")), "{}: {s} missing", p.prog);
+                }
+                if a.act == Act::Sub {
+                    assert!(flat.contains(&format!("{{{}}}", a.choices.join(","))), "{}: subcommands", p.prog);
+                } else if !a.is_option() && p.prog != "agent-display exec" && p.prog != "agent-display launch" {
+                    assert!(flat.contains(a.dest) || !a.choices.is_empty(), "{}: {} missing", p.prog, a.dest);
+                }
+            }
+            for (_, sub) in &p.subs {
+                walk(sub, n);
+            }
+        }
+        let mut n = 0;
+        walk(&build(), &mut n);
+        assert_eq!(n, TEXTS.len(), "cli_text.rs has entries for parsers that don't exist");
     }
 
     #[test]

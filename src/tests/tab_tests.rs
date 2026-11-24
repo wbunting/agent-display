@@ -245,7 +245,8 @@ both!(eval_exception_is_nonzero_with_text, |f: Fx| {
     assert!(err.contains("TypeError: x is not a function"), "{err}");
 });
 
-both!(refuses_foreign_and_reserved_ports, |f: Fx| {
+both!(refuses_foreign_and_reserved_ports, |mut f: Fx| {
+    f.sys.port_free = Some(false); // something else listens on 9500
     for port in ["9333", "9222", "9500"] {
         f.b.st().calls.clear();
         let (code, _, err) = f.cli(&["open", "--port", port]);
@@ -257,16 +258,49 @@ both!(refuses_foreign_and_reserved_ports, |f: Fx| {
 
 both!(refuses_listener_outside_unit, |f: Fx| {
     *f.ready.borrow_mut() = Box::new(|_| false);
-    let (code, _, err) = f.cli(&["eval", "OTHERTAB00000001", "1"]);
+    let (code, _, err) = f.cli(&["eval", "--port", "9425", "OTHERTAB00000001", "1"]);
     assert_eq!(code, 1);
     assert!(err.contains("refusing"), "{err}");
     assert!(f.calls().is_empty());
+    assert!(f.sys.sleeps.borrow().is_empty(), "refusals are not retried");
+});
+
+both!(unowned_listener_during_lookup_is_retried_then_tempfail, |f: Fx| {
+    // Without --port, a registered browser whose listener can't be proven
+    // (restarting, or not its own) gives no answer about the tab: retry,
+    // then 75. Never "closed", never a CDP call to that port.
+    *f.ready.borrow_mut() = Box::new(|_| false);
+    let (code, _, err) = f.cli(&["eval", "OTHERTAB00000001", "1"]);
+    assert_eq!(code, 75, "{err}");
+    assert!(err.contains("not served from agent-display-browser"), "{err}");
+    assert!(!err.contains("closed"), "{err}");
+    assert!(f.calls().is_empty());
+    assert_eq!(*f.sys.sleeps.borrow(), vec![0.5, 1.0, 2.0, 4.0]);
+});
+
+both!(unregistered_free_port_is_browser_down, |mut f: Fx| {
+    f.sys.port_free = Some(true); // nothing listens there any more
+    for argv in [&["open", "--port", "9500"][..], &["info", "--port", "9500", "OTHERTAB00000001"]] {
+        let (code, _, err) = f.cli(argv);
+        assert_eq!(code, 5, "{argv:?}: {err}");
+        assert!(err.contains("no agent-display browser on port 9500"), "{err}");
+    }
+    assert!(f.calls().is_empty());
+});
+
+both!(no_browser_running_is_browser_down, |f: Fx| {
+    *f.sys.browsers.borrow_mut() = Some(vec![]);
+    for argv in [&["info", "OTHERTAB00000001"][..], &["list"], &["open"], &["close", "OTHERTAB00000001"]] {
+        let (code, _, err) = f.cli(argv);
+        assert_eq!(code, 5, "{argv:?}: {err}");
+        assert!(err.contains("no agent-display browser is running"), "{err}");
+    }
 });
 
 both!(reserved_port_never_trusted_even_if_registered, |f: Fx| {
     *f.sys.browsers.borrow_mut() = Some(vec![info("agent-display-browser", 9333)]);
     let (code, _, _) = f.cli(&["list"]);
-    assert_eq!(code, 1);
+    assert_eq!(code, 5, "a reserved port is never a usable browser");
     assert!(f.calls().is_empty());
 });
 
@@ -283,9 +317,11 @@ both!(close_only_affects_given_tab, |f: Fx| {
 });
 
 both!(unknown_or_non_page_targets_refused, |f: Fx| {
-    for (tab, why) in [("NOSUCHTAB0000001", "no tab"), ("FRAME00000000001", "not a tab"), ("../../etc", "invalid")] {
+    for (tab, code_want, why) in
+        [("NOSUCHTAB0000001", 4, "no tab"), ("FRAME00000000001", 1, "not a tab"), ("../../etc", 1, "invalid")]
+    {
         let (code, _, err) = f.cli(&["close", tab]);
-        assert_eq!(code, 1);
+        assert_eq!(code, code_want, "{tab}: {err}");
         assert!(err.contains(why), "{tab}: {err}");
     }
     assert!(!f.methods().contains(&"Target.closeTarget".to_string()));
@@ -312,9 +348,11 @@ both!(lookup_skips_unhealthy_other_browser, |f: Fx| {
     let (code, out, _) = f.cli(&["info", "OTHERTAB00000001"]);
     assert_eq!(code, 0);
     assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["url"], "https://a/");
+    // The tab may be in the browser that didn't answer: not "gone".
     let (code, _, err) = f.cli(&["info", "NOSUCHTAB0000001"]);
-    assert_eq!(code, 1);
-    assert!(err.contains("skipped unhealthy browsers: 9001"), "{err}");
+    assert_eq!(code, 75, "{err}");
+    assert!(err.contains("try again: 9001 (CDP on port 9001 is not served from"), "{err}");
+    assert!(!err.contains("closed"), "{err}");
 });
 
 both!(list_shows_pages_only, |f: Fx| {
@@ -438,7 +476,11 @@ sway_only!(failed_resize_falls_back_and_removes_output, |f: Fx| {
 
 sway_only!(gc_removes_leaked_output_but_nothing_unmarked, |f: Fx| {
     let a = f.open(&[]);
-    f.sw().closed(a["tab"].as_str().unwrap()); // window gone, tab never closed
+    // Its agent died: the tab went with the browser window, `tab close`
+    // never ran.
+    let atab = a["tab"].as_str().unwrap().to_string();
+    f.sw().closed(&atab);
+    f.b.st().targets.retain(|(k, _)| *k != atab);
     {
         let mut st = f.sw().st();
         st.outputs.push("HEADLESS-9".into()); // someone else's empty output
@@ -508,7 +550,7 @@ both!(close_gives_up_after_three_attempts, |f: Fx| {
     f.b.set_hook(|m, _| if m == "Target.closeTarget" { Hook::Return(Err(timed_out_close())) } else { Hook::Pass });
     f.sys.sleeps.borrow_mut().clear();
     let (code, _, err) = f.cli(&["close", &tab]);
-    assert_eq!(code, 1);
+    assert_eq!(code, 75, "a close that keeps stalling: try again later");
     assert!(err.contains("timed out waiting for Target.closeTarget"), "{err}");
     assert_eq!(close_calls(&f), 3);
     let backoff: Vec<f64> = f.sys.sleeps.borrow().iter().copied().filter(|s| *s >= 1.0).collect();
@@ -522,14 +564,14 @@ fn close_fails_fast_when_the_browser_unit_is_not_active() {
     f.b.set_hook(|m, _| if m == "Target.closeTarget" { Hook::Return(Err(timed_out_close())) } else { Hook::Pass });
     f.sys.active = Some(false); // browsers() is stubbed; only the retry asks systemd
     let (code, _, _) = f.cli(&["close", &tab]);
-    assert_eq!(code, 1);
+    assert_eq!(code, 5, "its browser is down");
     assert_eq!(close_calls(&f), 1);
     assert!(f.sys.sleeps.borrow().is_empty());
 }
 
 both!(close_never_retries_refusals, |f: Fx| {
     *f.ready.borrow_mut() = Box::new(|_| false);
-    let (code, _, err) = f.cli(&["close", "OTHERTAB00000001"]);
+    let (code, _, err) = f.cli(&["close", "--port", "9425", "OTHERTAB00000001"]);
     assert_eq!(code, 1);
     assert!(err.contains("not served from"), "{err}");
     assert!(f.sys.sleeps.borrow().is_empty());
@@ -552,4 +594,228 @@ both!(close_retries_when_lookup_skipped_a_stalled_browser, |mut f: Fx| {
     assert_eq!(code, 0, "{err}");
     assert!(!f.b.has(&tab));
     assert_eq!(*stalls.borrow(), 0);
+});
+
+// ------------------------------------------------------------ lookup by id
+
+fn count(f: &Fx, m: &str) -> usize {
+    f.methods().iter().filter(|x| *x == m).count()
+}
+
+fn no_target() -> Hook {
+    Hook::Return(Err(Error::new("Target.getTargetInfo: No target with given id found")))
+}
+
+both!(lookup_asks_by_id_never_scans_json_list, |f: Fx| {
+    let tab = f.open(&[])["tab"].as_str().unwrap().to_string();
+    f.sys.targets_timeouts.borrow_mut().clear();
+    let shot = f.t.root.join("s.png");
+    for argv in [
+        vec!["info", tab.as_str()],
+        vec!["eval", tab.as_str(), "1"],
+        vec!["goto", tab.as_str(), "https://x/"],
+        vec!["shot", tab.as_str(), shot.to_str().unwrap()],
+    ] {
+        let (code, _, err) = f.cli(&argv);
+        assert_eq!(code, 0, "{argv:?}: {err}");
+    }
+    assert!(f.sys.targets_timeouts.borrow().is_empty(), "no /json/list");
+    assert_eq!(count(&f, "Target.getTargetInfo"), 4);
+    let infos: Vec<Value> = f.calls().into_iter().filter(|c| c.0 == "Target.getTargetInfo").map(|c| c.1).collect();
+    assert!(infos.iter().all(|p| *p == json!({"targetId": tab})));
+});
+
+both!(lookup_connection_keeps_the_callers_timeout, |f: Fx| {
+    // The lookup connects with a short step timeout; page commands on that
+    // connection must still get --timeout (here: the default call timeout).
+    let (code, _, _) = f.cli(&["eval", "--timeout", "42", "OTHERTAB00000001", "1"]);
+    assert_eq!(code, 0);
+    let eff = f.b.st().effective.clone();
+    let of = |m: &str| eff.iter().find(|(x, _)| x == m).unwrap().1;
+    assert_eq!(of("Target.getTargetInfo"), 5.0);
+    assert_eq!(of("Target.attachToTarget"), 42.0);
+    assert_eq!(of("Runtime.evaluate"), 42.0);
+});
+
+both!(tab_missing_from_one_pass_is_found_on_recheck, |f: Fx| {
+    // The flaky case from the field: a live tab that a browser briefly
+    // doesn't report. Two misses in one pass (before and after
+    // Target.getTargets), then found: exit 0, not "gone".
+    let mut misses = 2;
+    f.b.set_hook(move |m, _| {
+        if m == "Target.getTargetInfo" && misses > 0 {
+            misses -= 1;
+            return no_target();
+        }
+        Hook::Pass
+    });
+    let (code, out, err) = f.cli(&["info", "OTHERTAB00000001"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["url"], "https://a/");
+    assert_eq!(*f.sys.sleeps.borrow(), vec![0.25]);
+    assert_eq!(count(&f, "Target.getTargets"), 1, "hosts are created before a miss counts");
+});
+
+both!(miss_then_host_creation_finds_the_tab_in_one_pass, |f: Fx| {
+    let mut misses = 1;
+    f.b.set_hook(move |m, _| {
+        if m == "Target.getTargetInfo" && misses > 0 {
+            misses -= 1;
+            return no_target();
+        }
+        Hook::Pass
+    });
+    let (code, _, err) = f.cli(&["info", "OTHERTAB00000001"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(f.sys.sleeps.borrow().is_empty());
+});
+
+both!(gone_takes_two_definitive_misses_and_exits_4, |f: Fx| {
+    let tab = f.open(&[])["tab"].as_str().unwrap().to_string();
+    f.b.st().targets.retain(|(k, _)| *k != tab); // crashed / closed elsewhere
+    f.b.st().calls.clear();
+    f.sys.sleeps.borrow_mut().clear();
+    for cmd in ["info", "eval", "close"] {
+        let mut argv = vec![cmd, tab.as_str()];
+        if cmd == "eval" {
+            argv.push("1");
+        }
+        let (code, out, err) = f.cli(&argv);
+        assert_eq!((code, out.as_str()), (4, ""), "{cmd}: {err}");
+        assert!(err.contains(&format!("no tab {tab} in an agent-display browser: it was closed or crashed (checked twice)")), "{err}");
+        assert!(!err.contains("closed?"), "{err}");
+    }
+    assert_eq!(*f.sys.sleeps.borrow(), vec![0.25; 3]);
+    assert_eq!(count(&f, "Target.getTargetInfo"), 3 * 4, "2 passes x (ask, getTargets, ask)");
+    assert!(!f.methods().contains(&"Target.closeTarget".to_string()));
+});
+
+fn stall_n(f: &mut Fx, n: usize) -> Rc<RefCell<usize>> {
+    let left = Rc::new(RefCell::new(n));
+    let l2 = left.clone();
+    f.sys_version_fail(move |_| {
+        let mut k = l2.borrow_mut();
+        if *k > 0 {
+            *k -= 1;
+            return Some(Error::os("timed out"));
+        }
+        None
+    });
+    left
+}
+
+both!(stalled_browser_is_tempfail_never_gone, |mut f: Fx| {
+    let tab = f.open(&[])["tab"].as_str().unwrap().to_string();
+    stall_n(&mut f, usize::MAX);
+    f.sys.sleeps.borrow_mut().clear();
+    let shot = f.t.root.join("s.png");
+    for argv in [
+        vec!["info", tab.as_str()],
+        vec!["eval", tab.as_str(), "1"],
+        vec!["shot", tab.as_str(), shot.to_str().unwrap()],
+        vec!["close", tab.as_str()],
+    ] {
+        let (code, out, err) = f.cli(&argv);
+        assert_eq!((code, out.as_str()), (75, ""), "{argv:?}: {err}");
+        assert!(err.contains(&format!("tab {tab}: no definitive answer after 5 attempts")), "{err}");
+        assert!(err.contains("try again: 9425 (agent-display-browser is not answering CDP on 9425: CDP: timed out)"), "{err}");
+        assert!(!err.contains("closed"), "{err}");
+    }
+    assert_eq!(f.sys.sleeps.borrow()[..4], [0.5, 1.0, 2.0, 4.0]);
+    assert!(f.b.has(&tab));
+});
+
+both!(stall_that_clears_within_the_budget_is_ridden_out, |mut f: Fx| {
+    let left = stall_n(&mut f, 2);
+    let (code, out, err) = f.cli(&["info", "OTHERTAB00000001"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["tab"], "OTHERTAB00000001");
+    assert_eq!(*left.borrow(), 0);
+    assert_eq!(*f.sys.sleeps.borrow(), vec![0.5, 1.0]);
+});
+
+// ------------------------------------------------------------ ownership cache
+
+both!(ownership_is_remembered_and_rechecked_from_proc, |mut f: Fx| {
+    std::fs::create_dir_all(f.t.rt.join("agent-display/browsers")).unwrap();
+    let owner_file = f.t.rt.join("agent-display/browsers/agent-display-browser.owner");
+    // First command: systemd + cgroup scan, remembered.
+    assert_eq!(f.cli(&["info", "OTHERTAB00000001"]).0, 0);
+    assert_eq!(*f.sys.listener_scans.borrow(), 1);
+    let saved: Value = serde_json::from_str(&std::fs::read_to_string(&owner_file).unwrap()).unwrap();
+    assert_eq!(saved, json!({"port": 9425, "pid": 4242, "start_time": 1, "inode": 7}));
+    // /proc still confirms that process and socket: no scan.
+    f.sys.owner_ok = Some(Box::new(|o| o.pid == 4242 && o.inode == 7));
+    for _ in 0..3 {
+        assert_eq!(f.cli(&["info", "OTHERTAB00000001"]).0, 0);
+    }
+    assert_eq!(*f.sys.listener_scans.borrow(), 1, "cache hits");
+    assert!(*f.sys.owner_checks.borrow() >= 3);
+    // Mismatch (browser restarted: new pid/socket): back to the full scan,
+    // which re-proves and re-remembers ownership.
+    f.sys.owner_ok = Some(Box::new(|_| false));
+    assert_eq!(f.cli(&["info", "OTHERTAB00000001"]).0, 0);
+    assert_eq!(*f.sys.listener_scans.borrow(), 2);
+    // ... or refuses, and forgets the stale owner.
+    *f.ready.borrow_mut() = Box::new(|_| false);
+    let (code, _, err) = f.cli(&["info", "--port", "9425", "OTHERTAB00000001"]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("not served from"), "{err}");
+    assert!(!owner_file.exists());
+});
+
+// ------------------------------------------------------------ gc guard
+
+fn win_id(f: &Fx, tab: &str) -> i64 {
+    *f.sw().st().wins.iter().find(|(_, w)| w.tab.as_deref() == Some(tab)).unwrap().0
+}
+
+fn unplugs(f: &Fx) -> Vec<String> {
+    f.sw().st().commands.iter().filter(|c| c.ends_with(" unplug")).cloned().collect()
+}
+
+sway_only!(gc_keeps_the_output_of_a_live_tab_whose_window_is_away, |f: Fx| {
+    let a = f.open(&[]);
+    let atab = a["tab"].as_str().unwrap().to_string();
+    assert_eq!(a["output"], "HEADLESS-2");
+    // Its window is briefly off its output (remapped: fullscreen, dialog).
+    let id = win_id(&f, &atab);
+    f.sw().st().wins.get_mut(&id).unwrap().output = "HEADLESS-1".into();
+    f.open(&[]); // another agent's open runs gc
+    assert!(f.sw().st().outputs.contains(&"HEADLESS-2".to_string()));
+    assert_eq!(f.markers().get("HEADLESS-2"), Some(&atab));
+    assert!(unplugs(&f).is_empty(), "{:?}", unplugs(&f));
+    assert!(count(&f, "Target.getTargetInfo") >= 1, "asked the browser before unplugging");
+    // Once the tab really is gone, the next gc removes its output.
+    f.b.st().targets.retain(|(k, _)| *k != atab);
+    f.sw().closed(&atab);
+    f.open(&[]);
+    assert_eq!(unplugs(&f), vec!["output HEADLESS-2 unplug"]);
+    assert!(!f.markers().contains_key("HEADLESS-2"));
+});
+
+#[test]
+fn gc_keeps_outputs_while_the_browser_does_not_answer() {
+    let mut f = Fx::new(true);
+    let a = f.open(&[]);
+    let atab = a["tab"].as_str().unwrap().to_string();
+    f.sw().closed(&atab); // window gone, but we can't ask about the tab
+    stall_n(&mut f, usize::MAX);
+    let _lock = crate::tab::OutputsLock::acquire(&f.t.ctx(&f.sys)).unwrap();
+    let ctx = f.t.ctx(&f.sys);
+    let disp = f.sys.display(&ctx).unwrap();
+    assert!(crate::tab::gc_tab_outputs(&ctx, &disp).unwrap().is_empty());
+    assert!(f.sw().st().outputs.contains(&"HEADLESS-2".to_string()));
+}
+
+sway_only!(close_unplugs_its_output_without_asking_again, |f: Fx| {
+    let a = f.open(&[]);
+    let tab = a["tab"].as_str().unwrap().to_string();
+    f.b.st().calls.clear();
+    let (code, out, _) = f.cli(&["close", &tab]);
+    assert_eq!(code, 0);
+    assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["output"], "HEADLESS-2");
+    // One lookup before the close; none for the gc of its own output.
+    assert_eq!(count(&f, "Target.getTargetInfo"), 1);
+    assert!(f.sys.sleeps.borrow().iter().all(|s| *s != 0.25));
 });

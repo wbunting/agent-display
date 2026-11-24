@@ -76,9 +76,12 @@ pub fn cgroup_pids(dir: &Path) -> Vec<u32> {
 
 /// Does `pid` hold an fd for one of `inodes`?
 pub fn pid_has_socket(pid: u32, inodes: &HashSet<u64>) -> bool {
-    let Ok(rd) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
-        return false;
-    };
+    pid_socket(pid, inodes).is_some()
+}
+
+/// The first of `inodes` that `pid` holds an fd for.
+pub fn pid_socket(pid: u32, inodes: &HashSet<u64>) -> Option<u64> {
+    let rd = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
     for e in rd.flatten() {
         if let Ok(target) = std::fs::read_link(e.path()) {
             let t = target.as_os_str().as_encoded_bytes();
@@ -87,11 +90,57 @@ pub fn pid_has_socket(pid: u32, inodes: &HashSet<u64>) -> bool {
                 && let Some(inode) = std::str::from_utf8(num).ok().and_then(|s| s.parse::<u64>().ok())
                 && inodes.contains(&inode)
             {
-                return true;
+                return Some(inode);
             }
         }
     }
-    false
+    None
+}
+
+/// Start time of `pid` in clock ticks since boot (`/proc/PID/stat` field
+/// 22). With the pid it names one process: pids get reused, start times
+/// with them don't.
+pub fn pid_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm (field 2) may contain spaces and parens: split after the last ')'.
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// Who serves a browser's CDP port: the process inside the unit holding the
+/// LISTEN socket, remembered so later commands can re-check it from /proc
+/// alone (no systemctl, no cgroup walk).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Owner {
+    pub port: u16,
+    pub pid: u32,
+    pub start_time: u64,
+    pub inode: u64,
+}
+
+impl Owner {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({"port": self.port, "pid": self.pid, "start_time": self.start_time, "inode": self.inode})
+    }
+    pub fn from_json(v: &serde_json::Value) -> Option<Owner> {
+        Some(Owner {
+            port: u16::try_from(v.get("port")?.as_u64()?).ok()?,
+            pid: u32::try_from(v.get("pid")?.as_u64()?).ok()?,
+            start_time: v.get("start_time")?.as_u64()?,
+            inode: v.get("inode")?.as_u64()?,
+        })
+    }
+}
+
+/// Is the remembered owner still the one? All from /proc: same process
+/// (pid + start time), still inside the unit's cgroup, and the LISTEN socket
+/// on the port is still the same inode, held by that process.
+pub fn owner_valid(o: &Owner, unit: &str) -> bool {
+    o.inode != 0
+        && pid_start_time(o.pid) == Some(o.start_time)
+        && pid_in_unit(o.pid, unit)
+        && listen_inodes(o.port).contains(&o.inode)
+        && pid_socket(o.pid, &HashSet::from([o.inode])).is_some()
 }
 
 /// A cgroup path from systemd, as a directory under /sys/fs/cgroup.
@@ -103,16 +152,18 @@ pub fn cgroup_dir(cgroup: &str) -> Option<PathBuf> {
 }
 
 pub fn listener_in_unit(ctx: &Ctx, port: u16, unit: &str) -> bool {
+    listener_owner(ctx, port, unit).is_some()
+}
+
+/// The process inside `unit` (systemd's cgroup for it) that holds the
+/// LISTEN socket on `port`, or None.
+pub fn listener_owner(ctx: &Ctx, port: u16, unit: &str) -> Option<Owner> {
     let inodes = listen_inodes(port);
     if inodes.is_empty() {
-        return false;
+        return None;
     }
-    let Some(cg) = ctx.sys.unit_cgroup(ctx, &systemd::unit_name(unit)) else {
-        return false;
-    };
-    let Some(dir) = cgroup_dir(&cg) else {
-        return false;
-    };
+    let cg = ctx.sys.unit_cgroup(ctx, &systemd::unit_name(unit))?;
+    let dir = cgroup_dir(&cg)?;
     let mut pids = cgroup_pids(&dir);
     // Chromium's main process holds the listener: look there first. Only
     // the order changes; every pid scanned still comes from cgroup.procs.
@@ -120,7 +171,10 @@ pub fn listener_in_unit(ctx: &Ctx, port: u16, unit: &str) -> bool {
     if let Some(i) = main.and_then(|m| pids.iter().position(|p| *p == m)) {
         pids.swap(0, i);
     }
-    pids.into_iter().any(|pid| pid_has_socket(pid, &inodes))
+    pids.into_iter().find_map(|pid| {
+        let inode = pid_socket(pid, &inodes)?;
+        Some(Owner { port, pid, start_time: pid_start_time(pid)?, inode })
+    })
 }
 
 pub fn port_owner(ctx: &Ctx, port: u16) -> String {
@@ -221,6 +275,32 @@ mod tests {
         assert_eq!(inodes.len(), 1);
         assert!(pid_has_socket(std::process::id(), &inodes));
         assert!(!pid_has_socket(1, &inodes));
+    }
+
+    #[test]
+    fn owner_is_rechecked_from_proc_alone() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let pid = std::process::id();
+        let inode = *listen_inodes(port).iter().next().unwrap();
+        // Our own cgroup's last component stands in for the browser unit.
+        let cg = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+        let unit = cg.lines().find_map(|l| l.strip_prefix("0::")).unwrap().rsplit('/').next().unwrap().to_string();
+        let start_time = pid_start_time(pid).unwrap();
+        let owner = Owner { port, pid, start_time, inode };
+        assert!(owner_valid(&owner, &unit));
+        assert_eq!(Owner::from_json(&owner.to_json()), Some(owner.clone()));
+        assert!(!owner_valid(&Owner { start_time: start_time + 1, ..owner.clone() }, &unit), "pid reused");
+        assert!(!owner_valid(&owner, "agent-display-browser.service"), "pid outside the unit");
+        assert!(!owner_valid(&Owner { inode: inode + 1, ..owner.clone() }, &unit), "another socket");
+        drop(l);
+        assert!(!owner_valid(&owner, &unit), "nothing listening any more");
+    }
+
+    #[test]
+    fn start_time_survives_odd_process_names() {
+        assert!(pid_start_time(std::process::id()).is_some());
+        assert_eq!(pid_start_time(u32::MAX), None);
     }
 
     #[test]

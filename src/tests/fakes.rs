@@ -12,6 +12,8 @@ use serde_json::{Value, json};
 
 use crate::cdp::CdpConn;
 use crate::ctx::*;
+use crate::net::Owner;
+use crate::show::{VncEvent, VncEvents};
 use crate::util::{Environ, Error, Result, b64encode};
 
 // ------------------------------------------------------------ temp home
@@ -38,8 +40,23 @@ impl TempHome {
         Environ(vec![
             ("HOME".into(), self.home.to_string_lossy().into()),
             ("XDG_RUNTIME_DIR".into(), self.rt.to_string_lossy().into()),
-            ("PATH".into(), std::env::var("PATH").unwrap_or_else(|_| "/usr/bin".into())),
+            ("PATH".into(), self.path()),
         ])
+    }
+
+    /// PATH: `bin/` here (fake tools from `fake_tool`) before the real one.
+    pub fn path(&self) -> String {
+        format!("{}:{}", self.root.join("bin").display(), std::env::var("PATH").unwrap_or_else(|_| "/usr/bin".into()))
+    }
+
+    /// An executable stub named `name` on PATH (never run by the tests).
+    pub fn fake_tool(&self, name: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = self.root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let p = bin.join(name);
+        std::fs::write(&p, "#!/bin/sh\nexit 99\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     pub fn ctx<'a>(&self, sys: &'a FakeSys) -> Ctx<'a> {
@@ -86,6 +103,7 @@ impl Write for Buf {
 type ListenerFn = Box<dyn Fn(u16, &str) -> bool>;
 type UnitFn = Box<dyn Fn(&str) -> bool>;
 type HookFn = Box<dyn FnMut(&str, &Value) -> Hook>;
+type OwnerFn = Box<dyn Fn(&Owner) -> bool>;
 
 /// `None` fields fall back to inert defaults (nothing active, no
 /// listener), never to the real system.
@@ -116,6 +134,18 @@ pub struct FakeSys {
     pub hide_window: RefCell<bool>,
     pub mkdtemp_in: Option<PathBuf>,
     pub made: RefCell<Vec<PathBuf>>,
+    /// systemctl can't answer: every unit's state is unknown.
+    pub states_unknown: RefCell<bool>,
+    /// Answer to `owner_valid` (the /proc re-check); default: never valid.
+    pub owner_ok: Option<OwnerFn>,
+    pub owner_checks: RefCell<usize>,
+    /// Full listener scans (systemd + cgroup), i.e. cache misses.
+    pub listener_scans: RefCell<usize>,
+    /// Scripted wayvnc viewer events (then Closed); `vnc_events` calls.
+    pub vnc_script: RefCell<VecDeque<VncEvent>>,
+    pub vnc_opened: RefCell<Vec<PathBuf>>,
+    /// Unix sockets "wayvnc" made (systemd_run of a --unix-socket argv).
+    pub sockets: RefCell<Vec<std::os::unix::net::UnixListener>>,
 }
 
 pub fn info(unit: &str, port: i64) -> BrowserInfo {
@@ -137,8 +167,11 @@ impl Sys for FakeSys {
         }
         self.active.unwrap_or(false)
     }
-    fn units_active(&self, ctx: &Ctx, units: &[String]) -> Vec<bool> {
-        units.iter().map(|u| self.unit_active(ctx, u)).collect()
+    fn units_active(&self, ctx: &Ctx, units: &[String]) -> Vec<Option<bool>> {
+        if *self.states_unknown.borrow() {
+            return vec![None; units.len()];
+        }
+        units.iter().map(|u| Some(self.unit_active(ctx, u))).collect()
     }
     fn stop_units(&self, _ctx: &Ctx, units: &[String]) -> Result<()> {
         if !units.is_empty() {
@@ -150,6 +183,11 @@ impl Sys for FakeSys {
         let mut v = vec![unit.to_string()];
         v.extend(argv.iter().cloned());
         self.systemd_runs.borrow_mut().push(v);
+        // A started wayvnc makes its Unix socket.
+        if let Some(i) = argv.iter().position(|a| a == "--unix-socket") {
+            let l = std::os::unix::net::UnixListener::bind(&argv[i + 1]).unwrap();
+            self.sockets.borrow_mut().push(l);
+        }
         Ok(())
     }
     fn browsers(&self, ctx: &Ctx) -> Vec<BrowserInfo> {
@@ -163,6 +201,21 @@ impl Sys for FakeSys {
             return crate::net::listener_in_unit(ctx, port, unit);
         }
         self.listener.as_ref().is_some_and(|f| f(port, unit))
+    }
+    fn listener_owner(&self, ctx: &Ctx, port: u16, unit: &str) -> Option<Owner> {
+        *self.listener_scans.borrow_mut() += 1;
+        if self.cgroup.is_some() {
+            return crate::net::listener_owner(ctx, port, unit);
+        }
+        self.listener.as_ref().is_some_and(|f| f(port, unit)).then_some(Owner { port, pid: 4242, start_time: 1, inode: 7 })
+    }
+    fn owner_valid(&self, owner: &Owner, _unit: &str) -> bool {
+        *self.owner_checks.borrow_mut() += 1;
+        self.owner_ok.as_ref().is_some_and(|f| f(owner))
+    }
+    fn vnc_events(&self, _ctx: &Ctx, ctl: &Path) -> Result<Box<dyn VncEvents>> {
+        self.vnc_opened.borrow_mut().push(ctl.to_path_buf());
+        Ok(Box::new(FakeVnc(std::mem::take(&mut *self.vnc_script.borrow_mut()))))
     }
     fn unit_cgroup(&self, _ctx: &Ctx, _unit: &str) -> Option<String> {
         self.cgroup.clone().flatten()
@@ -192,12 +245,14 @@ impl Sys for FakeSys {
             None => Ok(vec![]),
         }
     }
-    fn cdp_connect(&self, _ctx: &Ctx, port: u16, _timeout: f64) -> Result<Box<dyn CdpConn>> {
+    fn cdp_connect(&self, _ctx: &Ctx, port: u16, timeout: f64) -> Result<Box<dyn CdpConn>> {
+        // Like Cdp::connect: /json/version first (where stalls show up).
+        self.cdp_version(port, timeout)?;
         let b = self.browser.clone().ok_or_else(|| Error::os("[Errno 111] Connection refused"))?;
         if b.st().fail_connect {
             return Err(Error::os("[Errno 111] Connection refused"));
         }
-        Ok(Box::new(FakeConn { b, port }))
+        Ok(Box::new(FakeConn { b, port, default: timeout }))
     }
     fn display(&self, ctx: &Ctx) -> Result<Disp> {
         match &self.display {
@@ -227,6 +282,13 @@ impl Sys for FakeSys {
     }
 }
 
+pub struct FakeVnc(pub VecDeque<VncEvent>);
+impl VncEvents for FakeVnc {
+    fn next(&mut self, _timeout: f64) -> VncEvent {
+        self.0.pop_front().unwrap_or(VncEvent::Closed)
+    }
+}
+
 // ------------------------------------------------------------ FakeBrowser
 
 /// What a test hook does with a CDP call.
@@ -243,6 +305,8 @@ pub struct BrowserState {
     pub targets: Vec<(String, Value)>,
     pub calls: Vec<Call>,
     pub timeouts: Vec<(String, Option<f64>)>,
+    /// (method, timeout it ran with: its own or the connection default).
+    pub effective: Vec<(String, f64)>,
     pub opened: usize,
     pub eval_result: Value,
     pub hook: Option<HookFn>,
@@ -262,6 +326,7 @@ impl FakeBrowser {
             ],
             calls: vec![],
             timeouts: vec![],
+            effective: vec![],
             opened: 0,
             eval_result: json!({"result": {"type": "string", "value": "Example"}}),
             hook: None,
@@ -348,6 +413,14 @@ impl FakeBrowser {
                 }
                 Ok(st.eval_result.clone())
             }
+            "Target.getTargetInfo" => {
+                let id = params["targetId"].as_str().unwrap_or("");
+                match st.targets.iter().find(|(k, _)| k == id) {
+                    Some((k, v)) => Ok(json!({"targetInfo": {
+                        "targetId": k, "type": v["type"], "title": v["title"], "url": v["url"], "attached": false}})),
+                    None => Err(Error::new("Target.getTargetInfo: No target with given id found")),
+                }
+            }
             "Page.captureScreenshot" => Ok(json!({"data": b64encode(b"\x89PNG fake")})),
             "Page.getLayoutMetrics" => Ok(json!({
                 "cssLayoutViewport": {"clientWidth": 800, "clientHeight": 600},
@@ -386,6 +459,8 @@ impl FakeBrowser {
 pub struct FakeConn {
     b: FakeBrowser,
     port: u16,
+    /// Default call timeout (as Cdp::timeout): recorded when a call has none.
+    default: f64,
 }
 
 impl CdpConn for FakeConn {
@@ -397,7 +472,11 @@ impl CdpConn for FakeConn {
         Ok(1)
     }
     fn call(&mut self, method: &str, params: Value, session: Option<&str>, timeout: Option<f64>) -> Result<Value> {
+        self.b.st().effective.push((method.to_string(), timeout.unwrap_or(self.default)));
         self.b.dispatch(method, params, session, timeout)
+    }
+    fn set_default_timeout(&mut self, timeout: f64) {
+        self.default = timeout;
     }
     fn wait_event(&mut self, method: &str, session: Option<&str>, _timeout: Option<f64>) -> Result<Value> {
         self.b.st().calls.push((format!("wait:{method}"), Value::Null, session.map(String::from)));

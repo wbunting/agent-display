@@ -34,6 +34,7 @@ cargo build --release          # target/release/agent-display
 cargo test                     # unit tests (stub systemd, sway and CDP)
 cargo clippy --all-targets -- -D warnings
 node isolation_check.mjs <cdp-port> <browser-unit>   # live, see below
+tests/e2e/phase0.sh [CHURN_SECONDS]                  # live, isolated, see below
 ```
 
 ## Dependencies
@@ -60,10 +61,44 @@ sequence of blocking request/response steps with deadlines.
    unit's cgroup pids (`ControlGroup` from systemd, `cgroup.procs`
    recursively; main pid scanned first). Same property as before.
 3. **Startup**: no interpreter or imports (~0.5 ms vs ~80 ms per command).
+4. **Tab lookup by id** (`Target.getTargetInfo` on the browser endpoint),
+   not by scanning `/json/list`, which leaves out a live page while its main
+   frame is swapped (cross-site navigation) and made agents see their tab
+   as closed. A miss counts only after `Target.getTargets` (DevTools hosts
+   are created lazily) and only when it repeats ~250 ms later.
+5. **Exit statuses** shared by all `tab` commands (`util::exit`, also in
+   `agent-display tab -h`): 0 ok, 1 error, 2 usage, 3 timed out, 4 tab gone
+   (closed or crashed, checked twice), 5 browser down, 6 read-back mismatch
+   (`tab type`), 75 no definitive answer (stalled or restarting browser,
+   after retries within 15 s): try again. A lookup never guesses "closed".
+6. **Unknown is not stopped**: `units_active` answers `Option<bool>`; a
+   failed or timed-out `systemctl` (or a unit mid-transition) no longer
+   deletes a running browser's registration.
+7. **Ownership from /proc**: the first full check (systemd cgroup scan)
+   records who serves a browser's CDP port in `browsers/<unit>.owner`
+   (pid, `/proc/PID/stat` start time, LISTEN socket inode). Later commands
+   re-prove that from /proc alone and fall back to the full check on any
+   mismatch; with a valid record a tab command calls no `systemctl`.
+8. **Output gc guard**: an empty tab output is unplugged only once its tab
+   is confirmed gone, so another agent's `tab open` no longer unplugs a live
+   tab's output while its window is briefly elsewhere.
+9. **`tab show TAB` / `tab unshow TAB`**: hand one tab to a human. A wayvnc
+   capturing only that tab's output, on a Unix socket in the runtime dir
+   (`vncviewer /run/user/1000/agent-display/vnc/HEADLESS-N.sock`), that
+   exits when the viewer disconnects or after `--timeout` (default 900 s).
+   `--wait-viewer`, `--until-url REGEX` and `--until-closed` keep it in the
+   foreground, printing `{"viewer": "connected"}` / `"disconnected"` JSON
+   lines and ending the view on the condition (the URL is never printed).
+   `tab close` and the output gc stop a tab's viewer. `view` gained
+   `--exit-on-disconnect`.
 
 Also: sway IPC over `SWAYSOCK` instead of `swaymsg` subprocesses (and a
 5 ms window poll in `tab open`/`close` instead of 20 ms); one `systemctl show`
 for all registered browser units instead of `systemctl is-active` per unit.
+
+`-h` and usage texts are in `src/cli_text.rs`, edited by hand now (the
+Python generator predates `tab show`); a test checks every parser has a
+matching entry.
 
 Known differences: `-h` and usage texts are always the 80-column argparse
 text (Python wraps to the terminal width and colours it on a TTY); error
@@ -73,9 +108,10 @@ texts that quote `swaymsg` or urllib internals read `sway IPC: ...` or
 
 ## Verification (omarchy, sway 1.12, Chromium on the shared display)
 
-- `cargo test`: 128 tests (the Python's 87 cases, with every `tab` case run
-  with and without the sway fake like the Python's subclass; plus parser,
-  JSON, IPC, WebSocket, wire-format, /proc ownership and retry tests).
+- `cargo test`: the Python's 87 cases, with every `tab` case run with and
+  without the sway fake like the Python's subclass; plus parser, JSON, IPC,
+  WebSocket, wire-format, /proc ownership and retry tests, and the lookup,
+  exit-status, owner-cache, gc-guard and `tab show` tests (176 in all).
 - `cargo clippy --all-targets --features bench-trace -- -D warnings`: clean.
 - Live: `status`, `start` (already running), persistent `browser start`
   (`already_running`), `browser start --temp` / `browser stop UNIT`
@@ -87,7 +123,24 @@ texts that quote `swaymsg` or urllib internals read `sway IPC: ...` or
   headless sway (devices registered; keyboard re-asserted after wtype exits),
   and stalls (SIGSTOP of a temp browser) for fix 1.
 - Not run live (shared host rules): `stop`, a fresh `start`, `view`,
-  `unview`, `launch`.
+  `unview`, `launch`. (`start`, `stop`, `view` and the tab changes above
+  run live in the isolated e2e below.)
+
+## Live checks without touching a live display
+
+`tests/e2e/phase0.sh` runs the real binary, with its real unit names, inside
+a nested `systemd --user` started as one outer unit (`ad-e2e-spaces-mgr`,
+`Delegate=yes`) with its own `XDG_RUNTIME_DIR`, `HOME` and a unit path of a
+few stock targets only (none of the user's units start there). The tool's
+`systemctl`/`systemd-run` reach only that manager; stopping the outer unit
+removes everything. It checks: lookups during concurrent tab churn and
+cross-site navigation, a SIGSTOPped browser (short stall ridden out, long
+stall exits 75), the gc guard (optionally against an older binary,
+`OLD_BIN=...`), `tab show` end to end with `tests/e2e/rfb.py` as the viewer
+(frame, click and typing, events, auto-exit, no listener left),
+`--until-url`, `unshow`, `view --exit-on-disconnect`, exit 4 after a real
+close and 5 after `browser stop`, and that the live agent-display units are
+unchanged. Only temp browsers; needs sway, chromium, wayvnc, python3, jq.
 
 ## Benchmark
 
