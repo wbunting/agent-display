@@ -67,9 +67,9 @@ sequence of blocking request/response steps with deadlines.
    as closed. A miss counts only after `Target.getTargets` (DevTools hosts
    are created lazily) and only when it repeats ~250 ms later.
 5. **Exit statuses** shared by all `tab` commands (`util::exit`, also in
-   `agent-display tab -h`): 0 ok, 1 error, 2 usage, 3 timed out, 4 tab gone
-   (closed or crashed, checked twice), 5 browser down, 6 read-back mismatch
-   (`tab type`), 75 no definitive answer (stalled or restarting browser,
+   `agent-display tab -h`): 0 ok, 1 error, 2 usage, 3 timed out
+   (`tab show --timeout`), 4 tab gone (closed or crashed, checked twice),
+   5 browser down, 75 no definitive answer (stalled or restarting browser,
    after retries within 15 s): try again. A lookup never guesses "closed".
 6. **Unknown is not stopped**: `units_active` answers `Option<bool>`; a
    failed or timed-out `systemctl` (or a unit mid-transition) no longer
@@ -81,11 +81,17 @@ sequence of blocking request/response steps with deadlines.
    mismatch; with a valid record a tab command calls no `systemctl`.
 8. **Output gc guard**: an empty tab output is unplugged only once its tab
    is confirmed gone, so another agent's `tab open` no longer unplugs a live
-   tab's output while its window is briefly elsewhere.
+   tab's output while its window is briefly elsewhere. One
+   `Target.getTargets` per browser covers all such outputs (plus one
+   recheck ~250 ms later), only when there are any.
 9. **`tab show TAB` / `tab unshow TAB`**: hand one tab to a human. A wayvnc
    capturing only that tab's output, on a Unix socket in the runtime dir
    (`vncviewer /run/user/1000/agent-display/vnc/HEADLESS-N.sock`), that
-   exits when the viewer disconnects or after `--timeout` (default 900 s).
+   exits when the viewer disconnects or after `--timeout` (default 900 s;
+   wayvnc's own kill timer runs 2 s later, so a waiting `show` exits 3
+   first). Showing a tab that is already shown reports the running
+   viewer's mode and remaining time, refuses a different `--view-only`
+   mode, and never stops a viewer it didn't start.
    `--wait-viewer`, `--until-url REGEX` and `--until-closed` keep it in the
    foreground, printing `{"viewer": "connected"}` / `"disconnected"` JSON
    lines and ending the view on the condition (the URL is never printed).

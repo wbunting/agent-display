@@ -785,7 +785,7 @@ sway_only!(gc_keeps_the_output_of_a_live_tab_whose_window_is_away, |f: Fx| {
     assert!(f.sw().st().outputs.contains(&"HEADLESS-2".to_string()));
     assert_eq!(f.markers().get("HEADLESS-2"), Some(&atab));
     assert!(unplugs(&f).is_empty(), "{:?}", unplugs(&f));
-    assert!(count(&f, "Target.getTargetInfo") >= 1, "asked the browser before unplugging");
+    assert!(count(&f, "Target.getTargets") >= 1, "asked the browser before unplugging");
     // Once the tab really is gone, the next gc removes its output.
     f.b.st().targets.retain(|(k, _)| *k != atab);
     f.sw().closed(&atab);
@@ -807,6 +807,44 @@ fn gc_keeps_outputs_while_the_browser_does_not_answer() {
     assert!(crate::tab::gc_tab_outputs(&ctx, &disp).unwrap().is_empty());
     assert!(f.sw().st().outputs.contains(&"HEADLESS-2".to_string()));
 }
+
+sway_only!(gc_asks_each_browser_at_most_twice_for_all_empty_outputs, |f: Fx| {
+    // Three agents' tabs, all with windows briefly away from their outputs,
+    // one of them really gone: one getTargets per pass for all of them, one
+    // 250 ms pause, only the gone tab's output unplugged.
+    let tabs: Vec<(String, String)> = (0..3)
+        .map(|_| {
+            let o = f.open(&[]);
+            (o["tab"].as_str().unwrap().to_string(), o["output"].as_str().unwrap().to_string())
+        })
+        .collect();
+    for (t, _) in &tabs {
+        let id = win_id(&f, t);
+        f.sw().st().wins.get_mut(&id).unwrap().output = "HEADLESS-1".into();
+    }
+    f.b.st().targets.retain(|(k, _)| *k != tabs[0].0);
+    f.b.st().calls.clear();
+    f.sys.sleeps.borrow_mut().clear();
+    f.open(&[]);
+    assert_eq!(count(&f, "Target.getTargets"), 2);
+    assert_eq!(count(&f, "Target.getTargetInfo"), 0);
+    assert_eq!(f.sys.sleeps.borrow().iter().filter(|s| **s == 0.25).count(), 1);
+    assert_eq!(unplugs(&f), vec![format!("output {} unplug", tabs[0].1)]);
+    // All alive: one pass, no pause.
+    f.b.st().calls.clear();
+    f.sys.sleeps.borrow_mut().clear();
+    f.open(&[]);
+    assert_eq!(count(&f, "Target.getTargets"), 1);
+    assert!(!f.sys.sleeps.borrow().contains(&0.25));
+    // No empty outputs: the browser isn't asked at all.
+    for (t, o) in &tabs[1..] {
+        let id = win_id(&f, t);
+        f.sw().st().wins.get_mut(&id).unwrap().output = o.clone();
+    }
+    f.b.st().calls.clear();
+    f.open(&[]);
+    assert_eq!(count(&f, "Target.getTargets"), 0);
+});
 
 sway_only!(close_unplugs_its_output_without_asking_again, |f: Fx| {
     let a = f.open(&[]);

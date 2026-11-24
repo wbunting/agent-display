@@ -537,6 +537,65 @@ pub fn cmd_hold_input(ctx: &Ctx) -> Result<i32> {
 
 // ------------------------------------------------------------ viewer
 
+/// What a wayvnc on the agent display serves and how (`view`, `tab show`).
+pub struct Wayvnc<'a> {
+    /// The one output it captures.
+    pub output: &'a str,
+    /// Its control socket (`wayvncctl -S`).
+    pub ctl: &'a Path,
+    /// Desktop name shown by viewers.
+    pub name: &'a str,
+    pub view_only: bool,
+    pub exit_on_disconnect: bool,
+    /// Trailing arguments: `ADDRESS PORT` or `--unix-socket PATH`.
+    pub listen: &'a [String],
+}
+
+/// argv for a wayvnc unit: the agent display's minimal env, `prefix` (e.g.
+/// a `timeout` wrapper), then wayvnc with an empty config (never the
+/// user's ~/.config/wayvnc: their tailnet listener and credentials), its
+/// own control socket, one output and no resizing.
+pub fn wayvnc_argv(ctx: &Ctx, disp: &Disp, prefix: &[String], w: &Wayvnc) -> Result<Vec<String>> {
+    let wayvnc = which("wayvnc", &ctx.env).ok_or_else(|| Error::new(format!("wayvnc not found ({})", install_hint("wayvnc"))))?;
+    let config = ctx.runtime_dir().join("wayvnc.config");
+    write_private(&config, "")?;
+    let mut argv = env_argv(&ctx.minimal_env(disp));
+    argv.extend(prefix.iter().cloned());
+    argv.push(wayvnc.to_string_lossy().into());
+    if w.view_only {
+        argv.push("--disable-input".into());
+    }
+    if w.exit_on_disconnect {
+        argv.push("--exit-on-disconnect".into());
+    }
+    argv.extend([
+        format!("--config={}", config.display()),
+        format!("--socket={}", w.ctl.display()),
+        format!("--output={}", w.output),
+        "--disable-resizing".into(),
+        "--render-cursor".into(),
+        format!("--name={}", w.name),
+    ]);
+    argv.extend(w.listen.iter().cloned());
+    Ok(argv)
+}
+
+/// Run `argv` as `unit` (bound to the display) and wait up to 10 s for
+/// `ready`. If it never gets ready, stop the unit and fail with its log.
+pub fn start_wayvnc(ctx: &Ctx, unit: &str, argv: &[String], stop_post: Option<&[String]>, description: &str, ready: &dyn Fn() -> bool) -> Result<()> {
+    ctx.sys.systemd_run(ctx, unit, argv, true, stop_post, Some(description))?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready() {
+        if Instant::now() > deadline || !ctx.sys.unit_active(ctx, unit) {
+            let log = journal_tail(ctx, unit, 12);
+            let _ = ctx.sys.stop_units(ctx, &[unit.to_string()]);
+            bail!("wayvnc did not start:\n{log}");
+        }
+        ctx.sys.sleep(0.05);
+    }
+    Ok(())
+}
+
 pub fn cmd_view(ctx: &Ctx, mut port: i64, view_only: bool, exit_on_disconnect: bool) -> Result<i32> {
     require(ctx, &["wayvnc"])?;
     let disp = display(ctx)?;
@@ -552,36 +611,16 @@ pub fn cmd_view(ctx: &Ctx, mut port: i64, view_only: bool, exit_on_disconnect: b
         port = current;
     } else {
         browser::check_port(ctx, port, RESERVED_VNC_PORTS)?;
-        let rt = ctx.runtime_dir();
-        // Empty config: never inherit ~/.config/wayvnc (the user's own
-        // tailnet listener, credentials). Separate control socket too.
-        write_private(&rt.join("wayvnc.config"), "")?;
-        let mut argv = env_argv(&ctx.minimal_env(&disp));
-        argv.push(which("wayvnc", &ctx.env).unwrap().to_string_lossy().into());
-        if view_only {
-            argv.push("--disable-input".into());
-        }
-        if exit_on_disconnect {
-            argv.push("--exit-on-disconnect".into());
-        }
-        argv.extend([
-            format!("--config={}", rt.join("wayvnc.config").display()),
-            format!("--socket={}", rt.join("wayvncctl").display()),
-            format!("--output={OUTPUT}"),
-            "--disable-resizing".into(),
-            "--render-cursor".into(),
-            "--name=agent-display".into(),
-            "127.0.0.1".into(),
-            port.to_string(),
-        ]);
-        ctx.sys.systemd_run(ctx, VNC_UNIT, &argv, true, None, Some("Agent display VNC viewer (loopback)"))?;
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !ctx.sys.listener_in_unit(ctx, port as u16, &unit_name(VNC_UNIT)) {
-            if Instant::now() > deadline || !ctx.sys.unit_active(ctx, VNC_UNIT) {
-                bail!("wayvnc did not start:\n{}", journal_tail(ctx, VNC_UNIT, 12));
-            }
-            ctx.sys.sleep(0.2);
-        }
+        let argv = wayvnc_argv(ctx, &disp, &[], &Wayvnc {
+            output: OUTPUT,
+            ctl: &ctx.runtime_dir().join("wayvncctl"),
+            name: "agent-display",
+            view_only,
+            exit_on_disconnect,
+            listen: &["127.0.0.1".into(), port.to_string()],
+        })?;
+        let ready = || ctx.sys.listener_in_unit(ctx, port as u16, &unit_name(VNC_UNIT));
+        start_wayvnc(ctx, VNC_UNIT, &argv, None, "Agent display VNC viewer (loopback)", &ready)?;
         write_private(&port_file, &port.to_string())?;
     }
     ctx.println(&format!(

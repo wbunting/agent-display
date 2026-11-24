@@ -66,14 +66,14 @@ fn show_serves_only_the_tabs_output_on_a_unix_socket() {
     let want = vec![
         bin.join("timeout").to_string_lossy().into_owned(),
         "--kill-after=5".into(),
-        "900".into(),
+        "902".into(), // wayvnc's own timer: 2 s after the view's deadline
         bin.join("wayvnc").to_string_lossy().into_owned(),
+        "--exit-on-disconnect".into(),
         format!("--config={}", f.t.rt.join("agent-display/wayvnc.config").display()),
         format!("--socket={}", ctl.display()),
         "--output=HEADLESS-2".into(),
         "--disable-resizing".into(),
         "--render-cursor".into(),
-        "--exit-on-disconnect".into(),
         "--name=agent-display HEADLESS-2".into(),
         "--unix-socket".into(),
         sock.to_string_lossy().into_owned(),
@@ -97,19 +97,93 @@ fn view_only_disables_input_and_timeout_bounds_the_view() {
     assert_eq!(lines(&out)[0]["view_only"], true);
     let argv = &viewer_runs(&f)[0];
     let i = argv.iter().position(|a| a == "--kill-after=5").unwrap();
-    assert_eq!(argv[i + 1], "120");
+    assert_eq!(argv[i + 1], "122");
     assert!(argv.contains(&"--disable-input".to_string()));
 }
 
 #[test]
-fn show_again_while_shown_reuses_the_viewer() {
+fn show_again_while_shown_reuses_the_viewer_and_reports_its_options() {
+    let f = fx();
+    let (tab, _) = opened(&f);
+    assert_eq!(f.cli(&["show", "--timeout", "600", &tab]).0, 0);
+    let state: Value =
+        serde_json::from_str(&std::fs::read_to_string(f.t.rt.join("agent-display/vnc/HEADLESS-2.json")).unwrap()).unwrap();
+    assert_eq!(state["view_only"], false);
+    // Asked with another timeout: the running viewer's remaining time is
+    // what counts and what is printed.
+    let (code, out, _) = f.cli(&["show", "--timeout", "30", &tab]);
+    assert_eq!(code, 0);
+    let l = &lines(&out)[0];
+    assert_eq!(l["already_shown"], true);
+    assert_eq!(l["view_only"], false);
+    let left = l["timeout"].as_f64().unwrap();
+    assert!((590.0..=600.0).contains(&left), "{left}");
+    assert_eq!(viewer_runs(&f).len(), 1);
+}
+
+#[test]
+fn show_refuses_a_different_mode_while_shown() {
     let f = fx();
     let (tab, _) = opened(&f);
     assert_eq!(f.cli(&["show", &tab]).0, 0);
-    let (code, out, _) = f.cli(&["show", &tab]);
+    // An interactive viewer is running: --view-only can't be promised.
+    let (code, out, err) = f.cli(&["show", "--view-only", &tab]);
+    assert_eq!((code, out.as_str()), (1, ""));
+    assert!(err.contains("already shown interactive; `agent-display tab unshow"), "{err}");
+    assert!(stopped(&f).is_empty(), "the running viewer is left alone");
+    assert_eq!(f.cli(&["unshow", &tab]).0, 0);
+    assert_eq!(f.cli(&["show", "--view-only", &tab]).0, 0);
+    let (code, _, err) = f.cli(&["show", &tab]);
+    assert_eq!(code, 1);
+    assert!(err.contains("already shown view-only"), "{err}");
+    // Unknown options (state file lost): refuse rather than guess.
+    std::fs::remove_file(f.t.rt.join("agent-display/vnc/HEADLESS-2.json")).unwrap();
+    let (code, _, err) = f.cli(&["show", "--view-only", &tab]);
+    assert_eq!(code, 1);
+    assert!(err.contains("unknown options"), "{err}");
+}
+
+#[test]
+fn waiting_on_someone_elses_viewer_never_stops_it() {
+    let f = fx();
+    let (tab, _) = opened(&f);
+    assert_eq!(f.cli(&["show", &tab]).0, 0);
+    // A second caller waits for the human, who leaves; the first caller's
+    // viewer exits by itself (--exit-on-disconnect), not by this show.
+    f.sys.vnc_script.borrow_mut().extend([ev("client-connected", 1), ev("client-disconnected", 0)]);
+    let (code, out, _) = f.cli(&["show", "--wait-viewer", &tab]);
     assert_eq!(code, 0);
-    assert_eq!(lines(&out)[0]["already_shown"], true);
-    assert_eq!(viewer_runs(&f).len(), 1);
+    assert_eq!(lines(&out).last().unwrap(), &json!({"unshown": tab, "reason": "disconnected"}));
+    assert!(stopped(&f).is_empty(), "{:?}", stopped(&f));
+    // Its own --timeout ends its wait (3) and still leaves the viewer up.
+    let (code, out, _) = f.cli(&["show", "--wait-viewer", "--timeout", "0.05", &tab]);
+    assert_eq!(code, 3);
+    assert_eq!(lines(&out).last().unwrap(), &json!({"unshown": tab, "reason": "timeout"}));
+    assert!(stopped(&f).is_empty(), "{:?}", stopped(&f));
+}
+
+#[test]
+fn viewer_killed_by_its_own_timer_at_the_deadline_is_a_timeout() {
+    // The review's case: wayvnc's timer fires, the event stream closes and
+    // the unit is already inactive. At the deadline that is exit 3, not a
+    // normal stop.
+    let mut f = fx();
+    let (tab, _) = opened(&f);
+    let starts = std::rc::Rc::new(std::cell::Cell::new(0));
+    let s2 = starts.clone();
+    // Active while show starts it (socket check), inactive once it is "killed".
+    f.sys.active_fn = Some(Box::new(move |u| {
+        if !u.starts_with("agent-display-vnc-") {
+            return true;
+        }
+        s2.set(s2.get() + 1);
+        s2.get() <= 1
+    }));
+    f.sys.active = None;
+    f.sys.vnc_script.borrow_mut().extend([ev("client-connected", 1), VncEvent::Closed]);
+    let (code, out, err) = f.cli(&["show", "--wait-viewer", "--timeout", "0.5", &tab]);
+    assert_eq!(code, 3, "{err}");
+    assert_eq!(lines(&out).last().unwrap(), &json!({"unshown": tab, "reason": "timeout"}));
 }
 
 #[test]

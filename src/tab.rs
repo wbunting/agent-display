@@ -150,7 +150,7 @@ enum Probe {
     Unavailable(String),
 }
 
-fn no_such_target(e: &Error) -> bool {
+pub(crate) fn no_such_target(e: &Error) -> bool {
     e.msg.contains("No target with given id")
 }
 
@@ -175,14 +175,8 @@ fn probe(ctx: &Ctx, port: u16, unit: &str, tab: &str, step: f64) -> Probe {
             Some(info) if info.is_object() => Probe::Found(info.clone(), cdp),
             _ => Probe::Unavailable(format!("{unit}: Target.getTargetInfo: no targetInfo")),
         },
-        Err(e) if no_such_target(&e) => {
-            cdp.close();
-            Probe::Missing
-        }
-        Err(e) => {
-            cdp.close();
-            Probe::Unavailable(format!("{unit} on {port}: {}", cdp_text(&e)))
-        }
+        Err(e) if no_such_target(&e) => Probe::Missing,
+        Err(e) => Probe::Unavailable(format!("{unit} on {port}: {}", cdp_text(&e))),
     }
 }
 
@@ -228,10 +222,7 @@ fn scan(ctx: &Ctx, tab: &str, port: Option<i64>, step: f64) -> Scan {
 pub fn tab_alive(ctx: &Ctx, tab: &str) -> Option<bool> {
     for pass in 0..2 {
         match scan(ctx, tab, None, LOOKUP_STEP_TIMEOUT) {
-            Scan::Found(mut f) => {
-                f.cdp.close();
-                return Some(true);
-            }
+            Scan::Found(_) => return Some(true),
             Scan::NoBrowser => return Some(false),
             Scan::Unavailable(_) => return None,
             Scan::Missing if pass == 0 => ctx.sys.sleep(GONE_RECHECK),
@@ -262,8 +253,6 @@ pub fn lookup(ctx: &Ctx, tab: &str, port: Option<i64>) -> Result<Found> {
             Scan::Found(f) => {
                 let kind = str_of(f.info.get("type"));
                 if kind != "page" {
-                    let mut cdp = f.cdp;
-                    cdp.close();
                     bail!("{tab} is a {kind}, not a tab");
                 }
                 return Ok(f);
@@ -306,11 +295,22 @@ pub fn lookup(ctx: &Ctx, tab: &str, port: Option<i64>) -> Result<Found> {
     }
 }
 
-/// (port, targetInfo) for TAB; see `lookup`.
-pub fn find_tab(ctx: &Ctx, tab: &str, port: Option<i64>) -> Result<(u16, Value)> {
-    let mut f = lookup(ctx, tab, port)?;
-    f.cdp.close();
-    Ok((f.port, f.info))
+/// Ids of every target in every running agent-display browser, from one
+/// `Target.getTargets` per browser (which also creates DevTools hosts for
+/// every live frame). None if any browser didn't answer: then nothing can
+/// be called gone.
+pub fn live_targets(ctx: &Ctx) -> Option<HashSet<String>> {
+    let mut ids = HashSet::new();
+    for (port, unit) in candidates(ctx, None) {
+        if listener_problem(ctx, port, &unit).is_some() {
+            return None;
+        }
+        let mut cdp = ctx.sys.cdp_connect(ctx, port, LOOKUP_STEP_TIMEOUT).ok()?;
+        let r = cdp.call("Target.getTargets", json!({}), None, Some(LOOKUP_STEP_TIMEOUT)).ok()?;
+        let infos = r.get("targetInfos")?.as_array()?;
+        ids.extend(infos.iter().filter_map(|t| t.get("targetId").and_then(Value::as_str).map(String::from)));
+    }
+    Some(ids)
 }
 
 /// `timeout or default`, as the Python's falsy check does.
@@ -584,7 +584,7 @@ pub fn marked_outputs(ctx: &Ctx) -> BTreeMap<String, String> {
 
 /// Unplug tab outputs whose window is gone. Call with OutputsLock held.
 /// Only marked `HEADLESS-N` outputs other than HEADLESS-1, only empty, and
-/// only once the marked tab is confirmed gone (`tab_alive`): an output that
+/// only once the marked tab is confirmed gone (`live_targets`, twice): an output that
 /// is briefly empty while its live tab's window is remapped (fullscreen, a
 /// dialog, a crashed GPU surface) stays. Its viewer (`tab show`) goes too.
 pub fn gc_tab_outputs(ctx: &Ctx, disp: &Disp) -> Result<Vec<String>> {
@@ -592,32 +592,49 @@ pub fn gc_tab_outputs(ctx: &Ctx, disp: &Disp) -> Result<Vec<String>> {
 }
 
 /// `gc_tab_outputs`, knowing that tab `closed` was just closed (no need to
-/// ask the browser about it).
+/// ask the browser about it). The browsers are asked at most twice per gc
+/// (all suspect tabs at once, then once more ~250 ms later), and only when
+/// an empty output's tab isn't known to be gone already.
 fn gc_outputs(ctx: &Ctx, disp: &Disp, closed: Option<&str>) -> Result<Vec<String>> {
     let counts = output_windows(ctx, disp)?;
-    let mut removed = Vec::new();
+    let mut gone: Vec<String> = Vec::new();
+    let mut suspects: Vec<(String, String)> = Vec::new();
     for (name, tab) in marked_outputs(ctx) {
         match counts.get(&name) {
             None => {
                 crate::show::stop_viewer(ctx, &name);
                 unlink_missing_ok(&ctx.tab_outputs_dir().join(&name));
             }
-            Some(0) => {
-                // "pending": its `tab open` died before creating the tab
-                // (markers are only pending while the lock is held).
-                let gone = tab == "pending" || closed == Some(tab.as_str()) || tab_alive(ctx, &tab) == Some(false);
-                if !gone {
-                    continue;
-                }
-                crate::show::stop_viewer(ctx, &name);
-                if ctx.sys.sway_cmd(disp, &format!("output {name} unplug")).is_err() {
-                    continue;
-                }
-                unlink_missing_ok(&ctx.tab_outputs_dir().join(&name));
-                removed.push(name);
-            }
+            // "pending": its `tab open` died before creating the tab
+            // (markers are only pending while the lock is held).
+            Some(0) if tab == "pending" || closed == Some(tab.as_str()) => gone.push(name),
+            Some(0) => suspects.push((name, tab)),
             Some(_) => {}
         }
+    }
+    for pass in 0..2 {
+        if suspects.is_empty() {
+            break;
+        }
+        if pass == 1 {
+            ctx.sys.sleep(GONE_RECHECK);
+        }
+        // A browser that doesn't answer: keep every suspect's output.
+        let Some(live) = live_targets(ctx) else {
+            suspects.clear();
+            break;
+        };
+        suspects.retain(|(_, tab)| !live.contains(tab));
+    }
+    gone.extend(suspects.into_iter().map(|(name, _)| name));
+    let mut removed = Vec::new();
+    for name in gone {
+        crate::show::stop_viewer(ctx, &name);
+        if ctx.sys.sway_cmd(disp, &format!("output {name} unplug")).is_err() {
+            continue;
+        }
+        unlink_missing_ok(&ctx.tab_outputs_dir().join(&name));
+        removed.push(name);
     }
     Ok(removed)
 }

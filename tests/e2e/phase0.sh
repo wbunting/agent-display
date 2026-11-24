@@ -239,6 +239,28 @@ check "until-url: exit 0, reason url-matched" bash -c "test $src -eq 0 && grep -
 check "until-url: viewer stopped (client cut off)" test "$(active_viewers)" -eq 0
 check "until-url: the URL (with its code) was never printed" not grep -q SECRET123 "$E2E_OUT/show2.jsonl"
 
+echo "-- show --timeout while a human is still connected: exit 3, viewer stopped"
+s=$SECONDS
+ad tab show "$A" --wait-viewer --timeout 4 > "$E2E_OUT/show3.jsonl" &
+SP=$!
+for _ in $(seq 50); do [ -s "$E2E_OUT/show3.jsonl" ] && break; sleep 0.1; done
+SOCK=$(head -1 "$E2E_OUT/show3.jsonl" | jq -r .socket)
+timeout 30 python3 -I "$HERE/rfb.py" "unix:$SOCK" "$E2E_OUT/show3-frame.png" --hold 15 > "$E2E_OUT/rfb3.out" 2>&1 &
+RP=$!
+wait "$SP"; src=$?; el=$((SECONDS - s))
+wait "$RP"; rfb3=$?
+cat "$E2E_OUT/show3.jsonl"; echo "[exit $src after ${el} s; viewer client exit $rfb3: $(tail -1 "$E2E_OUT/rfb3.out")]"
+check "timeout: exit 3, reason timeout" bash -c "test $src -eq 3 && grep -q '\"reason\": \"timeout\"' '$E2E_OUT/show3.jsonl'"
+check "timeout: within the --timeout (${el} s)" test "$el" -ge 3 -a "$el" -le 6
+check "timeout: viewer stopped, the human's connection cut" bash -c "test $(active_viewers) -eq 0 && test $rfb3 -ne 0"
+
+echo "-- reuse: a running interactive viewer can't be re-shown view-only"
+run ad tab show "$A"
+run ad tab show "$A" --view-only
+check "different mode while shown: exit 1" test "$rc" -eq 1
+check "the running viewer is left alone" test "$(active_viewers)" -eq 1
+run ad tab unshow "$A"
+
 echo "-- show (returns at once) + unshow"
 run ad tab show "$A" --view-only
 UNIT=$(nsys list-units --plain --no-legend 'agent-display-vnc*' | awk '{print $1}')

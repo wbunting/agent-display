@@ -9,27 +9,31 @@
 //! listening. Its control socket reports viewers connecting and leaving
 //! (`wayvncctl event-receive`), which `show` prints as JSON lines when it
 //! stays in the foreground.
+//!
+//! `vnc/HEADLESS-N.json` records how the running viewer was started
+//! (view-only, when it expires), so a second `show` reports the viewer that
+//! actually runs and refuses to pretend a different mode.
 
 use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
 
 use crate::cli::{ShowOpts, TabOpts};
 use crate::ctx::*;
-use crate::display::display;
-use crate::systemd::journal_tail;
-use crate::tab::{GONE_RECHECK, lookup, marked_outputs, output_windows, tab_alive, valid_tab_id};
-use crate::util::{Error, Result, exit, is_socket, py_repr, unlink_missing_ok, which, write_private};
+use crate::display::{Wayvnc, display, start_wayvnc, wayvnc_argv};
+use crate::tab::{GONE_RECHECK, lookup, marked_outputs, no_such_target, output_windows, tab_alive, valid_tab_id};
+use crate::util::{Error, Result, exit, fmt_g, is_socket, py_repr, unlink_missing_ok, which, write_private};
 use crate::{bail, json};
 
 /// How often a foreground `show` checks the tab (URL, still open).
 const TAB_POLL: f64 = 0.5;
-/// How long `show` waits for wayvnc's socket.
-const START_TIMEOUT: f64 = 10.0;
+/// wayvnc's own kill timer runs this much past the view's deadline, so a
+/// foreground `show` always reaches its deadline (exit 3) first.
+pub const VIEWER_GRACE: f64 = 2.0;
 
 /// The viewer unit for a tab output (`agent-display-vnc-headless-3`).
 pub fn viewer_unit(output: &str) -> String {
@@ -44,11 +48,26 @@ pub fn viewer_control(ctx: &Ctx, output: &str) -> PathBuf {
     ctx.vnc_dir().join(format!("{output}.ctl"))
 }
 
+/// How the viewer of an output was started.
+pub fn viewer_state(ctx: &Ctx, output: &str) -> PathBuf {
+    ctx.vnc_dir().join(format!("{output}.json"))
+}
+
+fn unix_now() -> f64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+}
+
+/// The running viewer's options: (view_only, expires at, unix seconds).
+fn read_state(ctx: &Ctx, output: &str) -> Option<(bool, f64)> {
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(viewer_state(ctx, output)).ok()?).ok()?;
+    Some((v.get("view_only")?.as_bool()?, v.get("expires")?.as_f64()?))
+}
+
 /// Stop the viewer of `output`, if there is one. Cheap when there isn't:
 /// only asks systemd when a socket of it exists.
 pub fn stop_viewer(ctx: &Ctx, output: &str) -> bool {
-    let (sock, ctl) = (viewer_socket(ctx, output), viewer_control(ctx, output));
-    if !sock.exists() && !ctl.exists() {
+    let files = [viewer_socket(ctx, output), viewer_control(ctx, output), viewer_state(ctx, output)];
+    if !files.iter().any(|f| f.exists()) {
         return false;
     }
     let unit = viewer_unit(output);
@@ -56,8 +75,9 @@ pub fn stop_viewer(ctx: &Ctx, output: &str) -> bool {
     if was {
         let _ = ctx.sys.stop_units(ctx, &[unit]);
     }
-    unlink_missing_ok(&sock);
-    unlink_missing_ok(&ctl);
+    for f in &files {
+        unlink_missing_ok(f);
+    }
     was
 }
 
@@ -200,24 +220,34 @@ pub fn cmd_tab_show(ctx: &Ctx, o: &TabOpts, tab: &str, s: &ShowOpts) -> Result<i
     }
     let foreground = s.wait_viewer || s.until_closed || until_url.is_some();
     let disp = display(ctx)?;
-    let wayvnc = tool(ctx, "wayvnc")?;
     let timeout_bin = tool(ctx, "timeout")?;
+    tool(ctx, "wayvnc")?;
     let mut found = lookup(ctx, tab, o.port_raw)?;
     let Some(output) = tab_output(ctx, tab) else {
-        found.cdp.close();
         bail!("tab {tab} has no output of its own (opened before outputs existed, or sway couldn't add one); open a new tab with `tab open` and show that");
     };
-    let windows = output_windows(ctx, &disp)?.get(&output).copied().unwrap_or(0);
-    if windows == 0 {
-        found.cdp.close();
+    if output_windows(ctx, &disp)?.get(&output).copied().unwrap_or(0) == 0 {
         bail!("tab {tab}'s window is not on {output} right now; try again");
     }
     let unit = viewer_unit(&output);
-    let (sock, ctl) = (viewer_socket(ctx, &output), viewer_control(ctx, &output));
-    let already = ctx.sys.unit_active(ctx, &unit) && is_socket(&sock);
-    if !already {
-        start_viewer(ctx, &disp, &unit, &output, &sock, &ctl, s, &wayvnc, &timeout_bin)?;
-    }
+    let sock = viewer_socket(ctx, &output);
+    let running = ctx.sys.unit_active(ctx, &unit) && is_socket(&sock);
+    // When the view ends: ours from --timeout, or the running viewer's.
+    let (view_only, expires) = if running {
+        let Some((view_only, expires)) = read_state(ctx, &output) else {
+            bail!("tab {tab} is already shown by a viewer with unknown options; `agent-display tab unshow {tab}` first");
+        };
+        if view_only != s.view_only {
+            let (has, want) = if view_only { ("view-only", "interactive") } else { ("interactive", "view-only") };
+            bail!("tab {tab} is already shown {has}; `agent-display tab unshow {tab}` first to show it {want}");
+        }
+        (view_only, expires)
+    } else {
+        let expires = unix_now() + s.timeout; // before the launch: see VIEWER_GRACE
+        start_viewer(ctx, &disp, &unit, &output, s.view_only, expires, &timeout_bin)?;
+        (s.view_only, expires)
+    };
+    let left = (expires - unix_now()).max(0.0);
     let sock_s = sock.to_string_lossy().into_owned();
     emit(ctx, vec![
         ("shown", tab.into()),
@@ -225,112 +255,89 @@ pub fn cmd_tab_show(ctx: &Ctx, o: &TabOpts, tab: &str, s: &ShowOpts) -> Result<i
         ("socket", sock_s.clone().into()),
         ("viewer_command", format!("vncviewer {sock_s}").into()),
         ("unit", unit.clone().into()),
-        ("view_only", s.view_only.into()),
-        ("timeout", json!(s.timeout)),
-        ("already_shown", already.into()),
+        ("view_only", view_only.into()),
+        ("timeout", json!((left * 10.0).round() / 10.0)),
+        ("already_shown", running.into()),
     ]);
     if !foreground {
-        found.cdp.close();
         return Ok(0);
     }
-    let events = match ctx.sys.vnc_events(ctx, &ctl) {
-        Ok(e) => e,
-        Err(e) => {
-            found.cdp.close();
-            return Err(e);
-        }
-    };
-    let r = follow(ctx, tab, &output, &unit, s, until_url.as_ref(), events, found.cdp.as_mut());
-    found.cdp.close();
-    r
+    let events = ctx.sys.vnc_events(ctx, &viewer_control(ctx, &output))?;
+    // Waiting on someone else's viewer: our own --timeout may end the wait
+    // earlier, but only the caller that started a viewer stops it.
+    let deadline = Instant::now() + Duration::from_secs_f64(left.min(s.timeout));
+    let view = View { tab, output: &output, unit: &unit, owned: !running, deadline };
+    follow(ctx, &view, s, until_url.as_ref(), events, found.cdp.as_mut())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn start_viewer(
-    ctx: &Ctx,
-    disp: &Disp,
-    unit: &str,
-    output: &str,
-    sock: &Path,
-    ctl: &Path,
-    s: &ShowOpts,
-    wayvnc: &str,
-    timeout_bin: &str,
-) -> Result<()> {
+fn start_viewer(ctx: &Ctx, disp: &Disp, unit: &str, output: &str, view_only: bool, expires: f64, timeout_bin: &str) -> Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     match std::fs::DirBuilder::new().mode(0o700).create(ctx.vnc_dir()) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e.into()),
     }
-    unlink_missing_ok(sock);
-    unlink_missing_ok(ctl);
-    // Empty config: never the user's ~/.config/wayvnc (see `view`).
-    let config = ctx.runtime_dir().join("wayvnc.config");
-    write_private(&config, "")?;
-    let mut argv = env_argv(&ctx.minimal_env(disp));
-    argv.extend([
-        timeout_bin.to_string(),
-        "--kill-after=5".into(),
-        crate::util::fmt_g(s.timeout),
-        wayvnc.to_string(),
-    ]);
-    if s.view_only {
-        argv.push("--disable-input".into());
+    let (sock, ctl, state) = (viewer_socket(ctx, output), viewer_control(ctx, output), viewer_state(ctx, output));
+    for f in [&sock, &ctl, &state] {
+        unlink_missing_ok(f);
     }
-    argv.extend([
-        format!("--config={}", config.display()),
-        format!("--socket={}", ctl.display()),
-        format!("--output={output}"),
-        "--disable-resizing".into(),
-        "--render-cursor".into(),
-        "--exit-on-disconnect".into(),
-        format!("--name=agent-display {output}"),
-        "--unix-socket".into(),
-        sock.to_string_lossy().into_owned(),
-    ]);
-    let post: Vec<String> =
-        vec!["/usr/bin/rm".into(), "-f".into(), "--".into(), sock.to_string_lossy().into(), ctl.to_string_lossy().into()];
-    ctx.sys.systemd_run(ctx, unit, &argv, true, Some(&post), Some(&format!("Agent display VNC for one tab ({output})")))?;
-    let deadline = Instant::now() + Duration::from_secs_f64(START_TIMEOUT);
-    for _ in 0..(START_TIMEOUT / 0.05) as usize {
-        if is_socket(sock) {
-            return Ok(());
+    // wayvnc dies VIEWER_GRACE after the view's deadline at the latest.
+    let kill_in = (expires - unix_now()).max(0.0) + VIEWER_GRACE;
+    let prefix = [timeout_bin.to_string(), "--kill-after=5".into(), fmt_g(kill_in.ceil())];
+    let argv = wayvnc_argv(ctx, disp, &prefix, &Wayvnc {
+        output,
+        ctl: &ctl,
+        name: &format!("agent-display {output}"),
+        view_only,
+        exit_on_disconnect: true,
+        listen: &["--unix-socket".into(), sock.to_string_lossy().into_owned()],
+    })?;
+    let mut post: Vec<String> = vec!["/usr/bin/rm".into(), "-f".into(), "--".into()];
+    post.extend([&sock, &ctl, &state].iter().map(|p| p.to_string_lossy().into_owned()));
+    let ready = || is_socket(&sock);
+    if let Err(e) = start_wayvnc(ctx, unit, &argv, Some(&post), &format!("Agent display VNC for one tab ({output})"), &ready) {
+        for f in [&sock, &ctl, &state] {
+            unlink_missing_ok(f);
         }
-        if Instant::now() > deadline || !ctx.sys.unit_active(ctx, unit) {
-            break;
-        }
-        ctx.sys.sleep(0.05);
+        return Err(Error::new(format!("{output}: {}", e.msg)));
     }
-    let log = journal_tail(ctx, unit, 12);
-    let _ = ctx.sys.stop_units(ctx, &[unit.to_string()]);
-    unlink_missing_ok(sock);
-    unlink_missing_ok(ctl);
-    bail!("wayvnc did not start for {output}:\n{log}");
+    write_private(&state, &json::dumps(&json!({"view_only": view_only, "expires": expires}), true))
+}
+
+/// The view a foreground `show` follows.
+struct View<'a> {
+    tab: &'a str,
+    output: &'a str,
+    unit: &'a str,
+    /// This invocation started the viewer (so it may stop it).
+    owned: bool,
+    deadline: Instant,
 }
 
 /// Foreground part of `show`: print viewer events until the view ends.
-#[allow(clippy::too_many_arguments)]
 fn follow(
     ctx: &Ctx,
-    tab: &str,
-    output: &str,
-    unit: &str,
+    v: &View,
     s: &ShowOpts,
     until_url: Option<&regex_lite::Regex>,
     mut events: Box<dyn VncEvents>,
     cdp: &mut dyn crate::cdp::CdpConn,
 ) -> Result<i32> {
-    let deadline = Instant::now() + Duration::from_secs_f64(s.timeout);
+    let tab = v.tab;
     let mut seen_viewer = false;
     let mut next_poll = Instant::now();
     let end = |reason: &str, code: i32| -> Result<i32> {
-        stop_viewer(ctx, output);
+        if v.owned {
+            stop_viewer(ctx, v.output);
+        }
         emit(ctx, vec![("unshown", tab.into()), ("reason", reason.into())]);
         Ok(code)
     };
+    // wayvnc's own timer ends VIEWER_GRACE after the deadline; an end
+    // this close to the deadline is the timeout.
+    let timed_out = || Instant::now() + Duration::from_secs_f64(VIEWER_GRACE / 2.0) >= v.deadline;
     loop {
-        let left = deadline.saturating_duration_since(Instant::now()).as_secs_f64();
+        let left = v.deadline.saturating_duration_since(Instant::now()).as_secs_f64();
         if left <= 0.0 {
             return end("timeout", exit::TIMEOUT);
         }
@@ -344,7 +351,7 @@ fn follow(
                         return end("url-matched", 0);
                     }
                 }
-                Err(e) if e.msg.contains("No target with given id") => {
+                Err(e) if no_such_target(&e) => {
                     ctx.sys.sleep(GONE_RECHECK);
                     if tab_alive(ctx, tab) == Some(false) {
                         return if s.until_closed { end("closed", 0) } else { end("tab-gone", exit::GONE) };
@@ -358,9 +365,11 @@ fn follow(
             VncEvent::Idle => {}
             VncEvent::Closed => {
                 // wayvnc exited: its last viewer left (--exit-on-disconnect),
-                // `tab unshow`, or its own timeout.
-                let gone = !ctx.sys.unit_active(ctx, unit);
-                if gone || seen_viewer {
+                // `tab unshow`, or its own timer at the deadline.
+                if timed_out() {
+                    return end("timeout", exit::TIMEOUT);
+                }
+                if seen_viewer || !ctx.sys.unit_active(ctx, v.unit) {
                     return end(if seen_viewer { "disconnected" } else { "stopped" }, 0);
                 }
                 // The event stream broke but wayvnc runs: keep the deadline.

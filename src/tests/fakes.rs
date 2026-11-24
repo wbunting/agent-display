@@ -413,6 +413,8 @@ impl FakeBrowser {
                 }
                 Ok(st.eval_result.clone())
             }
+            "Target.getTargets" => Ok(json!({"targetInfos": st.targets.iter().map(|(k, v)| json!({
+                "targetId": k, "type": v["type"], "title": v["title"], "url": v["url"], "attached": false})).collect::<Vec<_>>()})),
             "Target.getTargetInfo" => {
                 let id = params["targetId"].as_str().unwrap_or("");
                 match st.targets.iter().find(|(k, _)| k == id) {
