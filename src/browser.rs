@@ -335,26 +335,35 @@ pub fn cmd_browser_start(ctx: &Ctx, temp: bool, port_arg: Option<i64>, audio: bo
 /// Chromium writes cookies on a 30 s timer; SIGTERM, which `systemctl stop`
 /// sends to the whole cgroup, exits without a final flush. CDP
 /// Browser.close is a normal quit. Falls back to `systemctl stop`.
+///
+/// Only a confirmed stop counts as stopped: with the unit's state unknown
+/// (systemctl failing) it waits the full timeout and then stops the unit
+/// (a no-op if it has exited), so an Ok means it is gone.
 pub fn close_browser(ctx: &Ctx, unit: &str, port: Option<i64>, timeout: f64) -> Result<()> {
+    let up = || crate::systemd::unit_state(ctx, unit) != Some(false);
     if let Some(port) = port.and_then(|p| u16::try_from(p).ok()).filter(|p| *p != 0)
         && cdp_ready(ctx, port, unit)
     {
         let _ = cdp_send(ctx, port, "Browser.close", 5.0);
         let deadline = Instant::now() + Duration::from_secs_f64(timeout);
-        while ctx.sys.unit_active(ctx, unit) && Instant::now() < deadline {
+        while up() && Instant::now() < deadline {
             ctx.sys.sleep(0.2);
         }
     }
-    if ctx.sys.unit_active(ctx, unit) {
+    if up() {
         ctx.sys.stop_units(ctx, &[unit.to_string()])?;
     }
     Ok(())
 }
 
+/// Close each browser and forget it. A browser whose state is unknown is
+/// closed too; its registration is removed only once it is confirmed gone
+/// (close_browser Ok), never while it may still run (tab commands would
+/// then call it down, exit 5).
 pub fn close_browsers(ctx: &Ctx, units: &[String]) -> Result<()> {
     let known = ctx.sys.browsers(ctx);
     for unit in units {
-        if ctx.sys.unit_active(ctx, unit) {
+        if crate::systemd::unit_state(ctx, unit) != Some(false) {
             let port = known.iter().find(|b| b.unit() == unit).and_then(|b| b.port());
             close_browser(ctx, unit, port, 10.0)?;
         }

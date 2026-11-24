@@ -936,8 +936,11 @@ pub fn cmd_tab_close(ctx: &Ctx, o: &TabOpts, tab: &str) -> Result<i32> {
             }
             Err(e) if !retryable(&e) => return Err(e),
             Err(e) => {
-                let unit = unit_for_port(ctx, found.port);
-                if !unit.is_some_and(|u| ctx.sys.unit_active(ctx, &u)) {
+                // Browser down (5) only if unregistered or confirmed stopped.
+                // Unknown (systemctl failing during the same stall) or in
+                // transition: keep retrying, 75 after the last attempt.
+                let state = unit_for_port(ctx, found.port).map(|u| crate::systemd::unit_state(ctx, &u));
+                if matches!(state, None | Some(Some(false))) {
                     return Err(e.with_code(exit::BROWSER_DOWN));
                 }
                 if attempt >= CLOSE_ATTEMPTS {

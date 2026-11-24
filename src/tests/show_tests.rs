@@ -1019,3 +1019,21 @@ fn show_waits_for_a_window_that_is_briefly_off_its_output() {
     assert_eq!(polls.get(), 5);
     assert_eq!(viewer_runs(&f).len(), 1);
 }
+
+// ------------------------------------------------------------ round 8
+
+#[test]
+fn closed_stream_with_the_viewer_state_unknown_is_not_stopped() {
+    // The event stream ends but systemctl can't read the viewer unit: not
+    // "stopped" (0). Keep looking until the deadline: 3.
+    let mut f = fx();
+    f.sys.real_sleep_cap = Some(0.01);
+    let (tab, _) = opened(&f);
+    *f.sys.unknown_prefix.borrow_mut() = Some("agent-display-vnc-".into());
+    f.sys.vnc_script.borrow_mut().extend([VncEvent::Closed]);
+    let (code, out, err) = f.cli(&["show", "--wait-viewer", "--timeout", "1.2", &tab]);
+    assert_eq!(code, 3, "{err}");
+    assert_eq!(lines(&out).last().unwrap(), &json!({"unshown": tab, "reason": "timeout"}));
+    // Ours, so the end still stops it (unknown is stopped, not skipped).
+    assert_eq!(stopped(&f), vec!["agent-display-vnc-headless-2"]);
+}

@@ -601,6 +601,26 @@ fn browsers_registry_needs_no_systemctl_for_a_confirmed_owner() {
     assert_eq!(*asked.borrow(), vec!["agent-display-browser-tmp-x"]);
 }
 
+#[test]
+fn browser_stop_with_an_unknown_state_closes_it_and_forgets_it_only_when_gone() {
+    // systemctl can't read the browser unit: it may still run. Stop it
+    // (not skip it), and keep the registration if that fails, so tab
+    // commands don't call a running browser down (5).
+    let t = TempHome::new();
+    let sys = FakeSys::default();
+    *sys.states_unknown.borrow_mut() = true;
+    *sys.stop_fail.borrow_mut() = true;
+    let ctx = t.ctx(&sys);
+    let dir = write_registrations(&ctx);
+    let units = vec!["agent-display-browser".to_string()];
+    assert!(crate::browser::close_browsers(&ctx, &units).is_err());
+    assert!(dir.join("agent-display-browser.json").exists(), "kept while it may run");
+    *sys.stop_fail.borrow_mut() = false;
+    crate::browser::close_browsers(&ctx, &units).unwrap();
+    assert_eq!(*sys.stopped.borrow(), vec![units.clone()]);
+    assert!(!dir.join("agent-display-browser.json").exists());
+}
+
 // ------------------------------------------------------------ type
 
 #[test]

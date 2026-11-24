@@ -560,7 +560,13 @@ fn follow(
                 if timed_out() {
                     return end("timeout", exit::TIMEOUT);
                 }
-                if seen_viewer || !ctx.sys.unit_active(ctx, v.unit) {
+                // Stopped only if systemd says so: an unknown state (systemctl
+                // failing) is re-checked each poll until the deadline.
+                let stopped = matches!(
+                    ctx.sys.unit_active_state(ctx, v.unit).as_deref(),
+                    Some("deactivating" | "inactive" | "failed")
+                );
+                if seen_viewer || stopped {
                     if until {
                         // Nobody can see the tab any more, but the condition
                         // can still be met: keep watching the tab.
@@ -570,7 +576,8 @@ fn follow(
                     }
                     return end(if seen_viewer { "disconnected" } else { "stopped" }, 0);
                 }
-                // The event stream broke but wayvnc runs: keep the deadline.
+                // The event stream broke but wayvnc runs (or its state can't
+                // be read yet): keep the deadline, look again shortly.
                 ctx.sys.sleep(TAB_POLL);
             }
             VncEvent::Event(ev) => {

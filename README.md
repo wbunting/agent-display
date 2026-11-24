@@ -77,7 +77,11 @@ sequence of blocking request/response steps with deadlines.
    stalled browser exit 75 too.
 6. **Unknown is not stopped**: `units_active` answers `Option<bool>`; a
    failed or timed-out `systemctl` (or a unit mid-transition) no longer
-   deletes a running browser's registration.
+   deletes a running browser's registration. The same rule holds wherever a
+   state decides an outcome: a stalled `tab close` is 5 only if its browser
+   is unregistered or confirmed stopped (unknown keeps retrying, then 75);
+   `browser stop` closes a browser whose state is unknown and forgets it
+   only once it is gone; viewers are handled likewise (item 9).
 7. **Ownership from /proc**: the first full check (systemd cgroup scan)
    records who serves a browser's CDP port in `browsers/<unit>.owner`
    (pid, `/proc/PID/stat` start time, LISTEN socket inode). Later commands

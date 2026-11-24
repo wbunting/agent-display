@@ -974,3 +974,33 @@ both!(close_of_a_tab_closed_by_someone_else_meanwhile_is_gone, |f: Fx| {
         assert!(!f.sw().st().outputs.contains(&opened["output"].as_str().unwrap().to_string()));
     }
 });
+
+// ------------------------------------------------------------ unknown browser state on close
+
+#[test]
+fn close_stall_with_the_browser_state_unknown_retries_then_75() {
+    // closeTarget keeps timing out and systemctl can't read the browser
+    // unit's state (the same host stall): retry, then 75 — never 5.
+    let f = Fx::new(false);
+    let tab = f.open(&[])["tab"].as_str().unwrap().to_string();
+    f.b.set_hook(|m, _| if m == "Target.closeTarget" { Hook::Return(Err(timed_out_close())) } else { Hook::Pass });
+    *f.sys.unknown_prefix.borrow_mut() = Some("agent-display-browser".into());
+    f.sys.sleeps.borrow_mut().clear();
+    let (code, _, err) = f.cli(&["close", &tab]);
+    assert_eq!(code, 75, "{err}");
+    assert_eq!(close_calls(&f), 3);
+    let backoff: Vec<f64> = f.sys.sleeps.borrow().iter().copied().filter(|s| *s >= 1.0).collect();
+    assert_eq!(backoff, vec![1.0, 2.0]);
+    assert!(f.b.has(&tab));
+}
+
+#[test]
+fn close_stall_with_the_browser_confirmed_stopped_is_still_5() {
+    let mut f = Fx::new(false);
+    let tab = f.open(&[])["tab"].as_str().unwrap().to_string();
+    f.b.set_hook(|m, _| if m == "Target.closeTarget" { Hook::Return(Err(timed_out_close())) } else { Hook::Pass });
+    f.sys.active = Some(false); // systemd answers: inactive
+    let (code, _, _) = f.cli(&["close", &tab]);
+    assert_eq!(code, 5);
+    assert_eq!(close_calls(&f), 1);
+}
