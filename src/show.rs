@@ -33,8 +33,8 @@ use crate::ctx::*;
 use crate::display::{Wayvnc, display, start_wayvnc, wayvnc_argv};
 use crate::systemd::{is_running, stopping_or_stopped};
 use crate::tab::{
-    Found, GONE_RECHECK, LOOKUP_STEP_TIMEOUT, locate, lookup, marked_outputs, no_such_target, output_windows,
-    owned_ports, tab_alive, valid_tab_id,
+    Found, GONE_RECHECK, LOOKUP_STEP_TIMEOUT, locate, lookup, no_such_target, output_windows, owned_ports,
+    tab_alive, tab_output, valid_tab_id,
 };
 use crate::util::{Error, FileLock, Result, mkdir_private, exit, fmt_g, hex, is_socket, py_repr, random_bytes, unlink_missing_ok, which, write_private};
 use crate::{bail, json};
@@ -319,11 +319,6 @@ fn emit(ctx: &Ctx, pairs: Vec<(&str, Value)>) {
         m.insert(k.into(), v);
     }
     ctx.println(&json::dumps(&Value::Object(m), true));
-}
-
-/// The output `tab open` gave TAB (from its marker), if any.
-fn tab_output(ctx: &Ctx, tab: &str) -> Option<String> {
-    marked_outputs(ctx).into_iter().find(|(_, t)| t == tab).map(|(o, _)| o)
 }
 
 pub fn cmd_tab_show(ctx: &Ctx, o: &TabOpts, tab: &str, s: &ShowOpts) -> Result<i32> {

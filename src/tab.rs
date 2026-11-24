@@ -598,6 +598,11 @@ pub fn marked_outputs(ctx: &Ctx) -> BTreeMap<String, String> {
     out
 }
 
+/// The output `tab open` gave TAB (from its marker), if any.
+pub fn tab_output(ctx: &Ctx, tab: &str) -> Option<String> {
+    marked_outputs(ctx).into_iter().find(|(_, t)| t == tab).map(|(o, _)| o)
+}
+
 /// Unplug tab outputs whose window is gone. Call with OutputsLock held.
 /// Only marked `HEADLESS-N` outputs other than HEADLESS-1, only empty, and
 /// only once the marked tab is confirmed gone (`live_targets`, twice): an output that
@@ -794,7 +799,7 @@ pub fn create_tab_window(ctx: &Ctx, cdp: &mut dyn CdpConn) -> Result<(String, Op
 /// leftover output, so failures here never fail the command.
 pub fn remove_tab_output(ctx: &Ctx, tab: &str, timeout: f64) -> Option<String> {
     let disp = display(ctx).ok()?;
-    let output = marked_outputs(ctx).into_iter().find(|(_, t)| t == tab).map(|(o, _)| o)?;
+    let output = tab_output(ctx, tab)?;
     let deadline = Instant::now() + Duration::from_secs_f64(timeout);
     loop {
         let busy = output_windows(ctx, &disp).ok()?.get(&output).copied().unwrap_or(0) > 0;
