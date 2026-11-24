@@ -1178,3 +1178,32 @@ fn a_takeover_is_recorded_so_no_second_waiter_takes_the_viewer() {
     assert_eq!(st["waiter"], true);
     assert_eq!(st["token"], token, "same viewer, same token");
 }
+
+#[test]
+fn polls_timing_out_past_stall_recheck_look_the_tab_up_again() {
+    // The browser stalls (polls time out, never a broken connection), then
+    // dies. Only the STALL_RECHECK (5 s) recheck can notice: the view ends
+    // as browser-down soon after 5 s, not at its 30 s --timeout.
+    let mut f = fx();
+    f.sys.real_sleep_cap = Some(0.01);
+    let (tab, _) = opened(&f);
+    let b = f.b.clone();
+    let mut n = 0;
+    f.b.set_hook(move |m, _| {
+        if m == "Target.getTargetInfo" {
+            n += 1;
+            if n > 1 {
+                b.st().down = true; // gone, but our old connection only times out
+                return Hook::Return(Err(Error::new("timed out waiting for Target.getTargetInfo")));
+            }
+        }
+        Hook::Pass
+    });
+    f.sys.vnc_script.borrow_mut().extend([ev("client-connected", 1), ev("client-disconnected", 0), VncEvent::Closed]);
+    let t0 = std::time::Instant::now();
+    let (code, out, err) = f.cli(&["show", "--until-url", "/home", "--timeout", "30", &tab]);
+    let took = t0.elapsed().as_secs_f64();
+    assert_eq!(code, 5, "{err}");
+    assert_eq!(lines(&out).last().unwrap(), &json!({"unshown": tab, "reason": "browser-down"}));
+    assert!((5.0..10.0).contains(&took), "after the 5 s recheck, not before and not at --timeout: {took}");
+}
