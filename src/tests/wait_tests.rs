@@ -126,6 +126,63 @@ fn browser_gone(f: &mut Fx) {
     );
 }
 
+// ------------------------------------------------------------ URL hygiene
+
+const TOKEN: &str = "https://bank.example/device/approve?token=SECRET-ONE-TIME&lang=en#state=XYZ";
+
+#[test]
+fn printed_urls_and_url_like_titles_are_redacted_unless_show_url() {
+    for show_url in [false, true] {
+        let f = fx();
+        script(
+            &f,
+            vec![
+                state(TOKEN, "Approve", json!({"url": false})),
+                // A page whose title is its own URL (some approval pages).
+                state(TOKEN, "bank.example/device/approve?token=SECRET-ONE-TIME&lang=en", json!({"url": false})),
+                state("https://bank.example/done?code=SECRET-CODE", "Done", json!({"url": true})),
+            ],
+        );
+        let mut args = vec!["--url", "/done", "--follow"];
+        if show_url {
+            args.push("--show-url");
+        }
+        let (code, lines, err) = wait(&f, &args);
+        assert_eq!(code, 0, "{err}");
+        let states: Vec<&Value> = lines.iter().filter(|l| l["event"] == "state").collect();
+        let last = lines.last().unwrap();
+        assert_eq!(last["result"], "matched");
+        let all = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        if show_url {
+            assert_eq!(states[0]["url"], TOKEN);
+            assert_eq!(last["url"], "https://bank.example/done?code=SECRET-CODE");
+            assert!(all.contains("SECRET-ONE-TIME") && all.contains("SECRET-CODE"));
+        } else {
+            assert!(!all.contains("SECRET") && !err.contains("SECRET"), "{all}\n{err}");
+            assert_eq!(states[0]["url"], "https://bank.example/device/approve?token=…&lang=…#state=…");
+            assert_eq!(states[0]["title"], "Approve");
+            assert_eq!(states[1]["title"], "bank.example/device/approve?token=…&lang=…");
+            assert_eq!(last["url"], "https://bank.example/done?code=…");
+            assert_eq!(last["title"], "Done");
+            // Conditions still see the real URL: the page matched on it.
+            assert_eq!(last["matched"], json!({"url": true}));
+        }
+        // The regex goes to the page unredacted (it runs there).
+        assert!(checks(&f).iter().all(|c| c["arguments"][0]["value"]["url"] == "/done"), "{:?}", checks(&f));
+    }
+}
+
+#[test]
+fn timeout_line_redacts_the_last_url_too() {
+    let f = fx();
+    script(&f, vec![state(TOKEN, "", json!({"text": false}))]);
+    let (code, lines, _) = wait(&f, &["--text", "approved", "--timeout", "2"]);
+    assert_eq!(code, 3);
+    let last = lines.last().unwrap();
+    assert_eq!(last["url"], "https://bank.example/device/approve?token=…&lang=…#state=…");
+    assert!(!last.to_string().contains("SECRET"));
+}
+
 // ------------------------------------------------------------ matching
 
 #[test]

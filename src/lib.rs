@@ -9,8 +9,10 @@ pub mod cli_text;
 pub mod ctx;
 pub mod display;
 pub mod hold_input;
+pub mod input;
 pub mod json;
 pub mod net;
+pub mod redact;
 pub mod show;
 pub mod sway;
 pub mod systemd;
@@ -39,6 +41,7 @@ pub fn main_with(ctx: &Ctx, argv: &[String]) -> i32 {
         cmd,
         Cmd::TabOpen { .. } | Cmd::TabGoto { .. } | Cmd::TabEval { .. } | Cmd::TabShot { .. }
             | Cmd::TabInfo { .. } | Cmd::TabClose { .. } | Cmd::TabList { .. }
+            | Cmd::TabType { .. } | Cmd::TabClick { .. } | Cmd::TabSnapshot { .. }
             | Cmd::TabShow { .. } | Cmd::TabUnshow { .. } | Cmd::TabWait { .. }
     );
     match dispatch(ctx, &cmd) {
@@ -66,7 +69,7 @@ fn dispatch(ctx: &Ctx, cmd: &Cmd) -> util::Result<i32> {
         Env => display::cmd_env(ctx),
         Exec { argv } => display::cmd_exec(ctx, argv),
         Launch { name, argv } => display::cmd_launch(ctx, name, argv),
-        Windows => display::cmd_windows(ctx),
+        Windows { show_url } => display::cmd_windows(ctx, *show_url),
         Focus { id } => display::cmd_focus(ctx, *id),
         Screenshot { path, window } => display::cmd_screenshot(ctx, path, *window),
         Type { text } => display::cmd_type(ctx, text),
@@ -84,6 +87,22 @@ fn dispatch(ctx: &Ctx, cmd: &Cmd) -> util::Result<i32> {
         TabInfo { o, tab } => tab::cmd_tab_info(ctx, o, tab),
         TabClose { o, tab } => tab::cmd_tab_close(ctx, o, tab),
         TabList { o } => tab::cmd_tab_list(ctx, o),
+        TabType { o, tab, loc, text, stdin, keys, append, submit, keep_newline } => input::cmd_tab_type(
+            ctx,
+            o,
+            tab,
+            &input::TypeArgs {
+                loc: loc.clone(),
+                value: text.as_deref(),
+                stdin: *stdin,
+                keys: *keys,
+                append: *append,
+                submit: *submit,
+                keep_newline: *keep_newline,
+            },
+        ),
+        TabClick { o, tab, loc, count } => input::cmd_tab_click(ctx, o, tab, loc, *count),
+        TabSnapshot { o, tab, all } => input::cmd_tab_snapshot(ctx, o, tab, *all),
         TabShow { o, tab, show } => show::cmd_tab_show(ctx, o, tab, show),
         TabUnshow { tab } => show::cmd_tab_unshow(ctx, tab),
         TabWait { o, tab, spec } => wait::cmd_tab_wait(ctx, o, tab, spec),

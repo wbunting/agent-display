@@ -199,7 +199,16 @@ pub fn journal_tail(ctx: &Ctx, name: &str, lines: usize) -> String {
     keep[keep.len().saturating_sub(lines)..].join("\n")
 }
 
-pub fn systemd_run(ctx: &Ctx, unit: &str, argv: &[String], bind: bool, stop_post: Option<&[String]>, description: Option<&str>) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+pub fn systemd_run(
+    ctx: &Ctx,
+    unit: &str,
+    argv: &[String],
+    bind: bool,
+    stop_post: Option<&[String]>,
+    description: Option<&str>,
+    props: &[&str],
+) -> Result<()> {
     let mut cmd: Vec<String> = vec![
         "systemd-run".into(),
         "--user".into(),
@@ -214,6 +223,9 @@ pub fn systemd_run(ctx: &Ctx, unit: &str, argv: &[String], bind: bool, stop_post
     }
     if let Some(post) = stop_post {
         cmd.extend(["-p".into(), format!("ExecStopPost={}", shjoin(post))]);
+    }
+    for p in props {
+        cmd.extend(["-p".into(), p.to_string()]);
     }
     cmd.push("--".into());
     cmd.extend(argv.iter().cloned());

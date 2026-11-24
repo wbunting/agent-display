@@ -22,10 +22,80 @@ are shared).
 
 - The command line is parsed with the same algorithm as Python 3.14's
   argparse; usage and `-h` texts are generated from the Python parser
-  (`tools/gen_cli_text.py` → `src/cli_text.rs`, 80 columns).
+  (`tools/gen_cli_text.py` → `src/cli_text.rs`, 80 columns). Texts for
+  commands added or changed in Rust since (`tab` and its subcommands,
+  `windows`, `browser start`, `view`) come from
+  `python3 -I tools/gen_cli_text_rust.py src/cli_text.rs` (argparse, same
+  format; `--check` tells whether the file is current, and a unit test runs
+  it with python3 >= 3.14). Edit the generator, not `cli_text.rs`.
 - The sway config's `exec ... hold-input` runs this binary.
 - `type` splits text into wtype runs in-tree (ported from the `host-gui`
   skill, which the Python imports at runtime).
+
+## Typing, clicking and secrets
+
+Added in Rust (no Python equivalent):
+
+```sh
+TAB=$(agent-display tab open | jq -r .tab)
+echo "$ONE_TIME_LINK" | agent-display tab goto "$TAB" -     # URL on stdin, not argv
+agent-display tab snapshot "$TAB"                           # outline with refs; fields show [filled]/[empty]
+agent-display tab type "$TAB" --label Email agent@example.com
+set -o pipefail
+op read -n 'op://Vault/Item/password' | agent-display tab type "$TAB" --label Password --stdin
+agent-display tab type "$TAB" --label 'Verification code' --stdin --submit < "$CODE_FILE"
+agent-display tab click "$TAB" --role button --name 'Sign in'
+```
+
+- **Finding elements**: `--label` (label, `aria-label`, placeholder,
+  title), `--role` [`--name`], `--text` (click only), `--css`, `--ref` (from
+  `tab snapshot`) or `--focused`, plus `--nth N`. Names match exactly, then
+  ignoring case and spacing, then by substring; the best tier with any
+  match decides (a hidden exact match is waited for, never swapped for a
+  looser one). Several visible matches are an error that lists them. Every
+  frame is searched, including cross-origin (out-of-process) iframes; `--css`
+  runs in each frame's document but, like `querySelectorAll`, not inside
+  shadow roots (`--label`/`--role` find shadow-DOM fields). `type`/`click` wait up to `--timeout`
+  (default 10 s) for the element, polling every 100 ms backing off to 1 s.
+- **Refs** are `<doc>.<node>`: the 4-character document tag changes when a
+  frame loads a new document, so a ref from an old page fails ("no longer
+  loaded") instead of hitting a node of the new one, and an iframe's refs
+  never collide with the page's.
+- **Secrets**: `tab type --stdin` reads the value from stdin (refused if
+  stdin is a terminal, empty, over 64 KiB or not UTF-8; one trailing newline
+  is dropped unless `--keep-newline`). It never appears in argv, stdout,
+  stderr or errors, only in `Input.insertText`/`Input.dispatchKeyEvent`;
+  the process sets `PR_SET_DUMPABLE 0` first. Password fields and
+  `autocomplete=one-time-code`/`current-password`/`new-password`/`cc-number`/
+  `cc-csc` fields refuse a value on the command line. The field is checked by
+  length only: exit **6** if its length afterwards differs (maxlength, input
+  masks). `--keys` sends key presses (split one-time-code boxes).
+- **Clicks** happen at the element's centre once it is visible, not moving,
+  enabled and the topmost node there in every frame up to the page
+  (`DOM.getNodeForLocation`, which like the mouse skips `pointer-events:
+  none` layers), else e.g. `is covered by <div#modal> "..."`.
+- **Focus**: agent tabs never have OS focus, so `type`/`click` turn on
+  `Emulation.setFocusEmulationEnabled` while they run and off again when they
+  finish (also on errors). Chromium's own CDP input focuses the tab's widget
+  (as under Playwright), so after `type` the page may report
+  `document.hasFocus()` true; sway focus is never touched.
+- **URLs**: `tab open/goto/info/list/snapshot/wait` print URLs with query and
+  fragment values, userinfo and token-like path segments as `…`
+  (`--show-url` prints them in full); error messages are always redacted.
+  `tab list` also redacts titles that are Chromium's URL fallback (a page
+  without `<title>` is listed with its URL, query included, as the title),
+  and so does `windows` for window titles ("<url> - Chromium"; `windows
+  --show-url` prints them in full).
+  `tab open -`, `tab goto TAB -` and `browser start -` read URLs from stdin.
+- **Browser hygiene**: `browser start URL...` launches Chromium on
+  `about:blank` and opens the URLs over CDP, so they are not in the unit's
+  `ExecStart` or `/proc/PID/cmdline`. Browser units get `LimitCORE=0` (a
+  renderer core holds what was typed). Before each start the profile's
+  `Default/Preferences` gets the password manager, auto sign-in and
+  address/card autofill turned off.
+
+Exit codes: the shared `tab` statuses (Changes 5 below); `tab type` adds
+6 for a length mismatch (then `--submit` does not press Enter).
 
 ## Build and test
 
@@ -69,7 +139,8 @@ sequence of blocking request/response steps with deadlines.
 5. **Exit statuses** shared by all `tab` commands (`util::exit`, also in
    `agent-display tab -h`): 0 ok, 1 error, 2 usage, 3 timed out
    (`tab show`/`tab wait --timeout`), 4 tab gone (closed or crashed, checked twice),
-   5 browser down, 75 no definitive answer (stalled or restarting browser,
+   5 browser down, 6 verification mismatch (`tab type`; then `--submit`
+   does not press Enter), 75 no definitive answer (stalled or restarting browser,
    after retries within 15 s): try again. A lookup never guesses "closed".
    With or without `--port`: an explicit port is only checked for
    ownership up front (a foreign or hijacked port is refused, 1); whether
@@ -156,9 +227,10 @@ Also: sway IPC over `SWAYSOCK` instead of `swaymsg` subprocesses (and a
 5 ms window poll in `tab open`/`close` instead of 20 ms); one `systemctl show`
 for all registered browser units instead of `systemctl is-active` per unit.
 
-`-h` and usage texts are in `src/cli_text.rs`, edited by hand now (the
-Python generator predates `tab show` and `tab wait`); a test checks every parser has a
-matching entry.
+`-h` and usage texts are in `src/cli_text.rs`; entries for commands the
+Python predates (`tab show`, `tab wait`, `tab type/click/snapshot`, ...) come
+from `tools/gen_cli_text_rust.py` (see Compatibility); a test checks every
+parser has a matching entry.
 
 Known differences: `-h` and usage texts are always the 80-column argparse
 text (Python wraps to the terminal width and colours it on a TTY); error
@@ -177,7 +249,9 @@ crashed, 5 if the browser went down, 75 if the deadline passed while the
 browser was stalled. `--follow` prints
 a JSON line per state change, for background monitors. Use it instead of
 polling `tab info`/`tab list` when waiting for a human (phone approvals, SMS
-codes, email links). See [docs/tab-wait.md](docs/tab-wait.md).
+codes, email links). Its `url` (and a URL-like `title`) is redacted like
+every `tab` command's output unless `--show-url`; conditions such as `--url`
+still match the full URL in the page. See [docs/tab-wait.md](docs/tab-wait.md).
 
 ## Verification (omarchy, sway 1.12, Chromium on the shared display)
 
@@ -186,8 +260,9 @@ codes, email links). See [docs/tab-wait.md](docs/tab-wait.md).
   WebSocket, wire-format, /proc ownership and retry tests, the lookup,
   exit-status, owner-cache, gc-guard and `tab show` tests, `tab wait`
   against a scripted page with fake time and its in-page checker in node
-  (skipped without node), and dialog handling on a socket pair and in
-  `goto`/`eval`/`shot`/`info`.
+  (skipped without node), dialog handling on a socket pair and in
+  `goto`/`eval`/`shot`/`info`, and the `tab type/click/snapshot`, URL
+  redaction and browser hygiene tests (351 in all).
 - `cargo clippy --all-targets --features bench-trace -- -D warnings`: clean.
 - Live: `status`, `start` (already running), persistent `browser start`
   (`already_running`), `browser start --temp` / `browser stop UNIT`
@@ -201,6 +276,13 @@ codes, email links). See [docs/tab-wait.md](docs/tab-wait.md).
 - Not run live (shared host rules): `stop`, a fresh `start`, `view`,
   `unview`, `launch`. (`start`, `stop`, `view` and the tab changes above
   run live in the isolated e2e below.)
+- `tab type/click/snapshot`, URL redaction and browser hygiene: unit tests
+  against a fake page behind the fake CDP (`src/tests/input_tests.rs`:
+  frames incl. a cross-origin iframe session, AX tree, focus, hit testing,
+  field values; fake clock) and a live pass on a `--temp` browser against
+  `tests/fixtures/input-*.html` (served with `python3 -m http.server`;
+  `input-frame.html` embeds the login page from `localhost` so it runs
+  out of process).
 
 ## Live checks without touching a live display
 

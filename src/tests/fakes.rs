@@ -104,6 +104,8 @@ impl Write for Buf {
 type ListenerFn = Box<dyn Fn(u16, &str) -> bool>;
 type UnitFn = Box<dyn Fn(&str) -> bool>;
 type HookFn = Box<dyn FnMut(&str, &Value) -> Hook>;
+/// Like HookFn, but also gets the flat session the call was sent on.
+pub type SessionHookFn = Box<dyn FnMut(&str, &Value, Option<&str>) -> Hook>;
 type OwnerFn = Box<dyn Fn(&Owner) -> bool>;
 type SleepHook = Box<dyn FnMut(f64)>;
 
@@ -131,6 +133,13 @@ pub struct FakeSys {
     pub display: Option<Result<Disp>>,
     pub runs: RefCell<Vec<(Vec<String>, Option<Environ>)>>,
     pub systemd_runs: RefCell<Vec<Vec<String>>>,
+    /// `-p` properties of each systemd_run, in the same order.
+    pub systemd_props: RefCell<Vec<Vec<String>>>,
+    /// stdin for `--stdin`/`-` (None: empty) and whether it is a terminal.
+    pub stdin: RefCell<Option<Vec<u8>>>,
+    pub stdin_tty: bool,
+    pub stdin_reads: RefCell<usize>,
+    pub hardened: RefCell<bool>,
     pub stopped: RefCell<Vec<Vec<String>>>,
     pub sleeps: RefCell<Vec<f64>>,
     pub hide_window: RefCell<bool>,
@@ -262,7 +271,17 @@ impl Sys for FakeSys {
         self.inactive.borrow_mut().extend(units.iter().map(|u| u.trim_end_matches(".service").to_string()));
         Ok(())
     }
-    fn systemd_run(&self, _: &Ctx, unit: &str, argv: &[String], _: bool, _: Option<&[String]>, _: Option<&str>) -> Result<()> {
+    #[allow(clippy::too_many_arguments)]
+    fn systemd_run(
+        &self,
+        _: &Ctx,
+        unit: &str,
+        argv: &[String],
+        _: bool,
+        _: Option<&[String]>,
+        _: Option<&str>,
+        props: &[&str],
+    ) -> Result<()> {
         {
             let mut n = self.run_still_loaded.borrow_mut();
             if *n > 0 {
@@ -284,6 +303,7 @@ impl Sys for FakeSys {
         let mut v = vec![unit.to_string()];
         v.extend(argv.iter().cloned());
         self.systemd_runs.borrow_mut().push(v);
+        self.systemd_props.borrow_mut().push(props.iter().map(|p| p.to_string()).collect());
         self.inactive.borrow_mut().remove(unit.trim_end_matches(".service"));
         self.raw_state.borrow_mut().remove(unit.trim_end_matches(".service"));
         self.started.borrow_mut().insert(unit.trim_end_matches(".service").to_string());
@@ -436,6 +456,18 @@ impl Sys for FakeSys {
     fn now(&self) -> Instant {
         *self.clock_base.get_or_init(Instant::now) + Duration::from_secs_f64(self.clock.get())
     }
+    fn stdin_is_tty(&self) -> bool {
+        self.stdin_tty
+    }
+    fn read_stdin(&self, limit: usize) -> std::io::Result<Vec<u8>> {
+        *self.stdin_reads.borrow_mut() += 1;
+        let mut v = self.stdin.borrow_mut().take().unwrap_or_default();
+        v.truncate(limit);
+        Ok(v)
+    }
+    fn no_core_dumps(&self) {
+        *self.hardened.borrow_mut() = true;
+    }
     fn mkdtemp(&self, prefix: &str, dir: &Path) -> Result<PathBuf> {
         let p = crate::net::mkdtemp(prefix, self.mkdtemp_in.as_deref().unwrap_or(dir))?;
         self.made.borrow_mut().push(p.clone());
@@ -484,6 +516,7 @@ pub struct BrowserState {
     pub opened: usize,
     pub eval_result: Value,
     pub hook: Option<HookFn>,
+    pub session_hook: Option<SessionHookFn>,
     pub sway: Option<FakeSway>,
     pub fail_connect: bool,
     /// The browser has exited: no longer registered, connections refused.
@@ -494,7 +527,8 @@ pub struct BrowserState {
     pub next_conn: usize,
     pub dead_before: usize,
     pub dead_error: String,
-    /// Events the connection has queued (`take_events`).
+    /// Events the connection has queued: `take_events` drains them, and
+    /// `wait_event` returns the first with its method and session.
     pub events: Vec<Value>,
     /// Dialogs the connection has answered (`take_dialogs`).
     pub dialogs: Vec<Dialog>,
@@ -518,6 +552,7 @@ impl FakeBrowser {
             opened: 0,
             eval_result: json!({"result": {"type": "string", "value": "Example"}}),
             hook: None,
+            session_hook: None,
             sway: None,
             fail_connect: false,
             down: false,
@@ -565,6 +600,19 @@ impl FakeBrowser {
 
     pub fn set_hook(&self, f: impl FnMut(&str, &Value) -> Hook + 'static) {
         self.st().hook = Some(Box::new(f));
+    }
+
+    pub fn set_session_hook(&self, f: impl FnMut(&str, &Value, Option<&str>) -> Hook + 'static) {
+        self.st().session_hook = Some(Box::new(f));
+    }
+
+    /// Queue an event as Chromium would send it on `session`.
+    pub fn push_event(&self, method: &str, params: Value, session: Option<&str>) {
+        let mut e = json!({"method": method, "params": params});
+        if let Some(s) = session {
+            e["sessionId"] = s.into();
+        }
+        self.st().events.push(e);
     }
 
     fn handle(&self, method: &str, params: &Value, session: Option<&str>) -> Result<Value> {
@@ -639,14 +687,28 @@ impl FakeBrowser {
             st.calls.push((method.to_string(), params.clone(), session.map(String::from)));
             st.timeouts.push((method.to_string(), timeout));
         }
-        let hook = self.st().hook.take();
-        let decision = match hook {
+        let session_hook = self.st().session_hook.take();
+        let decision = match session_hook {
             Some(mut h) => {
-                let d = h(method, &params);
-                self.st().hook = Some(h);
+                let d = h(method, &params, session);
+                self.st().session_hook = Some(h);
                 d
             }
             None => Hook::Pass,
+        };
+        let decision = match decision {
+            Hook::Pass => {
+                let hook = self.st().hook.take();
+                match hook {
+                    Some(mut h) => {
+                        let d = h(method, &params);
+                        self.st().hook = Some(h);
+                        d
+                    }
+                    None => Hook::Pass,
+                }
+            }
+            other => other,
         };
         match decision {
             Hook::Pass => self.handle(method, &params, session),
@@ -690,7 +752,18 @@ impl CdpConn for FakeConn {
         self.default = timeout;
     }
     fn wait_event(&mut self, method: &str, session: Option<&str>, _timeout: Option<f64>) -> Result<Value> {
-        self.b.st().calls.push((format!("wait:{method}"), Value::Null, session.map(String::from)));
+        let mut st = self.b.st();
+        st.calls.push((format!("wait:{method}"), Value::Null, session.map(String::from)));
+        let hit = st.events.iter().position(|e| {
+            e["method"].as_str() == Some(method) && e.get("sessionId").and_then(Value::as_str) == session
+        });
+        if let Some(i) = hit {
+            return Ok(st.events.remove(i));
+        }
+        // Auto-attach events only come when there is something to attach.
+        if method == "Target.attachedToTarget" {
+            return Err(Error::new(format!("timed out waiting for {method}")));
+        }
         Ok(json!({"method": method}))
     }
     fn close(&mut self) {}
