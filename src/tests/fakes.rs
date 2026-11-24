@@ -1,16 +1,17 @@
 //! Stubs: a temp HOME/runtime dir, `FakeSys`, a fake Chromium CDP and a
 //! fake sway (outputs, windows, focus), mirroring the Python test doubles.
 
-use std::cell::{RefCell, RefMut};
+use std::cell::{Cell, OnceCell, RefCell, RefMut};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::cdp::CdpConn;
+use crate::cdp::{CdpConn, Dialog};
 use crate::ctx::*;
 use crate::net::Owner;
 use crate::show::{VncEvent, VncEvents};
@@ -184,6 +185,10 @@ pub struct FakeSys {
     pub viewer_start_seen: RefCell<Vec<(bool, bool)>>,
     /// Unix sockets "wayvnc" made (systemd_run of a --unix-socket argv).
     pub sockets: RefCell<Vec<std::os::unix::net::UnixListener>>,
+    /// Fake time: `now()` is a fixed base plus this many seconds; `sleep`
+    /// advances it. Shared, so CDP hooks can let time pass too.
+    pub clock: Rc<Cell<f64>>,
+    pub clock_base: OnceCell<Instant>,
 }
 
 pub fn info(unit: &str, port: i64) -> BrowserInfo {
@@ -426,6 +431,10 @@ impl Sys for FakeSys {
         if let Some(cap) = self.real_sleep_cap {
             std::thread::sleep(std::time::Duration::from_secs_f64(secs.clamp(0.0, cap)));
         }
+        self.clock.set(self.clock.get() + secs.max(0.0));
+    }
+    fn now(&self) -> Instant {
+        *self.clock_base.get_or_init(Instant::now) + Duration::from_secs_f64(self.clock.get())
     }
     fn mkdtemp(&self, prefix: &str, dir: &Path) -> Result<PathBuf> {
         let p = crate::net::mkdtemp(prefix, self.mkdtemp_in.as_deref().unwrap_or(dir))?;
@@ -485,6 +494,12 @@ pub struct BrowserState {
     pub next_conn: usize,
     pub dead_before: usize,
     pub dead_error: String,
+    /// Events the connection has queued (`take_events`).
+    pub events: Vec<Value>,
+    /// Dialogs the connection has answered (`take_dialogs`).
+    pub dialogs: Vec<Dialog>,
+    /// Last `set_dialog_policy` (accept?).
+    pub dialog_policy: Option<bool>,
 }
 
 #[derive(Clone)]
@@ -509,6 +524,9 @@ impl FakeBrowser {
             next_conn: 0,
             dead_before: 0,
             dead_error: "CDP closed the connection".into(),
+            events: vec![],
+            dialogs: vec![],
+            dialog_policy: None,
         })))
     }
 
@@ -601,6 +619,12 @@ impl FakeBrowser {
                 }
             }
             "Page.captureScreenshot" => Ok(json!({"data": b64encode(b"\x89PNG fake")})),
+            "Page.getFrameTree" => Ok(json!({"frameTree": {"frame": {"id": format!("FRAME-{}", target_of(session))}}})),
+            "Page.createIsolatedWorld" => Ok(json!({"executionContextId": 7})),
+            // `tab wait` checks have no default: script the page
+            // (wait_tests::script). Unscripted, every check fails, so the
+            // wait ends on its deadline with this as `stalled`.
+            "Runtime.callFunctionOn" => Err(Error::new("fake: unscripted Runtime.callFunctionOn")),
             "Page.getLayoutMetrics" => Ok(json!({
                 "cssLayoutViewport": {"clientWidth": 800, "clientHeight": 600},
                 "cssContentSize": {"height": 5000.5}
@@ -670,6 +694,15 @@ impl CdpConn for FakeConn {
         Ok(json!({"method": method}))
     }
     fn close(&mut self) {}
+    fn take_events(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.b.st().events)
+    }
+    fn set_dialog_policy(&mut self, accept: bool) {
+        self.b.st().dialog_policy = Some(accept);
+    }
+    fn take_dialogs(&mut self) -> Vec<Dialog> {
+        std::mem::take(&mut self.b.st().dialogs)
+    }
 }
 
 // ------------------------------------------------------------ FakeSway

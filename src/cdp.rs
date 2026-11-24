@@ -166,6 +166,59 @@ pub trait CdpConn {
     /// Timeout for calls that don't pass one (a connection made for a quick
     /// lookup is reused for page commands with the user's `--timeout`).
     fn set_default_timeout(&mut self, _timeout: f64) {}
+    /// Events queued while waiting for replies, oldest first (`tab wait`).
+    fn take_events(&mut self) -> Vec<Value> {
+        Vec::new()
+    }
+    /// Answer JavaScript dialogs that open on any session of this
+    /// connection: alert, confirm and prompt are accepted or dismissed per
+    /// `accept`; beforeunload is always accepted (see `answer_for`). The
+    /// session needs `Page.enable` to report them. See `Dialog`.
+    fn set_dialog_policy(&mut self, _accept: bool) {}
+    /// Dialogs answered since the last call, oldest first.
+    fn take_dialogs(&mut self) -> Vec<Dialog> {
+        Vec::new()
+    }
+}
+
+/// Error text for a call whose session went away before it answered.
+pub const DETACHED: &str = "CDP session detached";
+
+/// A JavaScript dialog this connection answered. Only its kind is kept:
+/// the message is page text and is never printed.
+///
+/// Why dialogs need an answer (Chromium 155, measured): a dialog that opens
+/// while no DevTools session is attached to a background tab is dismissed
+/// by Chromium. One that opens while any session is attached belongs to
+/// that session; if it detaches without `Page.handleJavaScriptDialog`, the
+/// renderer stays blocked in the dialog and the tab is wedged for every
+/// later client (`Runtime.evaluate` and `Page.enable` hang, a new session
+/// gets "No dialog is showing", nothing is drawn). So every `tab` session
+/// enables Page and the connection answers each dialog as it opens; the
+/// pending call then gets its reply as usual.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Dialog {
+    pub kind: String,
+    pub accepted: bool,
+}
+
+/// How a connection with dialog policy `accept` answers a dialog of type
+/// `kind`. A `beforeunload` dialog asks whether to leave the page: someone
+/// (`tab goto`, the agent's click, the user) started that navigation, and
+/// dismissing it ("Stay on page") cancels it with net::ERR_ABORTED. So it
+/// is always accepted, whatever the policy, and every session agrees when
+/// several are attached (the first answer wins).
+pub fn answer_for(kind: &str, accept: bool) -> bool {
+    kind == "beforeunload" || accept
+}
+
+fn detaches(msg: &Value, session: Option<&str>) -> bool {
+    let Some(s) = session else { return false };
+    match msg.get("method").and_then(Value::as_str) {
+        Some("Target.detachedFromTarget") => msg["params"]["sessionId"].as_str() == Some(s),
+        Some("Inspector.detached") => msg.get("sessionId").and_then(Value::as_str) == Some(s),
+        _ => false,
+    }
 }
 
 pub struct Cdp {
@@ -177,6 +230,8 @@ pub struct Cdp {
     parts: Vec<u8>,
     sock: Box<dyn Sock>,
     closed: bool,
+    dialog_accept: Option<bool>,
+    dialogs: Vec<Dialog>,
 }
 
 struct Frame {
@@ -210,7 +265,18 @@ impl Cdp {
     }
 
     pub fn with_sock(sock: Box<dyn Sock>, port: u16, timeout: f64) -> Cdp {
-        Cdp { port, timeout, next_id: 0, events: vec![], buf: vec![], parts: vec![], sock, closed: false }
+        Cdp {
+            port,
+            timeout,
+            next_id: 0,
+            events: vec![],
+            buf: vec![],
+            parts: vec![],
+            sock,
+            closed: false,
+            dialog_accept: None,
+            dialogs: vec![],
+        }
     }
 
     fn handshake(&mut self, port: u16, path: &str) -> Result<()> {
@@ -321,6 +387,27 @@ impl Cdp {
         }
         self.message(deadline, what)
     }
+
+    /// Queue an event, answering it first if it is a dialog and a policy
+    /// is set. Err if it detaches `session`: the pending call never answers.
+    fn event(&mut self, msg: Value, session: Option<&str>, what: &str) -> Result<()> {
+        if let (Some(accept), Some("Page.javascriptDialogOpening")) =
+            (self.dialog_accept, msg.get("method").and_then(Value::as_str))
+        {
+            let s = msg.get("sessionId").and_then(Value::as_str).map(String::from);
+            let kind = msg["params"]["type"].as_str().unwrap_or("alert").to_string();
+            let accepted = answer_for(&kind, accept);
+            // Fire and forget: its reply has an id nobody waits for.
+            self.send("Page.handleJavaScriptDialog", json!({"accept": accepted}), s.as_deref())?;
+            self.dialogs.push(Dialog { kind, accepted });
+        }
+        let gone = detaches(&msg, session);
+        self.events.push(msg);
+        if gone {
+            return Err(Error::new(format!("{what}: {DETACHED}")));
+        }
+        Ok(())
+    }
 }
 
 fn session_eq(ev: &Value, session: Option<&str>) -> bool {
@@ -368,9 +455,21 @@ impl CdpConn for Cdp {
                 return Ok(msg.get("result").cloned().unwrap_or_else(|| json!({})));
             }
             if msg.get("method").is_some() {
-                self.events.push(msg);
+                self.event(msg, session, method)?;
             }
         }
+    }
+
+    fn take_events(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.events)
+    }
+
+    fn set_dialog_policy(&mut self, accept: bool) {
+        self.dialog_accept = Some(accept);
+    }
+
+    fn take_dialogs(&mut self) -> Vec<Dialog> {
+        std::mem::take(&mut self.dialogs)
     }
 
     fn wait_event(&mut self, method: &str, session: Option<&str>, timeout: Option<f64>) -> Result<Value> {
@@ -385,7 +484,11 @@ impl CdpConn for Cdp {
             }
             let msg = self.recv(deadline, method)?;
             if msg.get("method").is_some() {
-                self.events.push(msg);
+                let wanted = msg.get("method").and_then(Value::as_str) == Some(method) && session_eq(&msg, session);
+                self.event(msg, session, method)?;
+                if wanted {
+                    return Ok(self.events.pop().unwrap_or(Value::Null));
+                }
             }
         }
     }
@@ -546,4 +649,145 @@ mod tests {
         assert_eq!(e.msg, "<urlopen error [Errno 111] Connection refused>");
         assert!(e.os);
     }
+    /// Server side of the socketpair: one client (masked) frame as JSON.
+    fn read_client(a: &mut UnixStream) -> Value {
+        let mut head = [0u8; 2];
+        a.read_exact(&mut head).unwrap();
+        let n = match head[1] & 0x7f {
+            126 => {
+                let mut ext = [0u8; 2];
+                a.read_exact(&mut ext).unwrap();
+                u16::from_be_bytes(ext) as usize
+            }
+            127 => {
+                let mut ext = [0u8; 8];
+                a.read_exact(&mut ext).unwrap();
+                u64::from_be_bytes(ext) as usize
+            }
+            n => n as usize,
+        };
+        let mut rest = vec![0u8; 4 + n];
+        a.read_exact(&mut rest).unwrap();
+        serde_json::from_slice(&unmask(&rest, 0)).unwrap()
+    }
+
+    fn write_server(a: &mut UnixStream, v: &Value) {
+        let body = serde_json::to_vec(v).unwrap();
+        let mut f = vec![0x81];
+        if body.len() < 126 {
+            f.push(body.len() as u8);
+        } else {
+            f.push(126);
+            f.extend((body.len() as u16).to_be_bytes());
+        }
+        f.extend(body);
+        a.write_all(&f).unwrap();
+    }
+
+    fn dialog_opening(session: &str, kind: &str) -> Value {
+        json!({"method": "Page.javascriptDialogOpening", "sessionId": session,
+               "params": {"type": kind, "message": "Your code is 123456", "url": "https://a/", "hasBrowserHandler": false}})
+    }
+
+    #[test]
+    fn call_fails_fast_when_its_session_detaches() {
+        let (mut a, mut cdp) = pair();
+        let t = std::thread::spawn(move || {
+            read_client(&mut a);
+            write_server(&mut a, &json!({"method": "Target.detachedFromTarget", "params": {"sessionId": "OTHER"}}));
+            write_server(&mut a, &json!({"method": "Target.detachedFromTarget", "params": {"sessionId": "S", "targetId": "T"}}));
+            a
+        });
+        let start = Instant::now();
+        let e = cdp.call("Runtime.callFunctionOn", json!({"functionDeclaration": "x".repeat(130)}), Some("S"), Some(30.0)).unwrap_err();
+        assert!(e.msg.contains(DETACHED), "{}", e.msg);
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert_eq!(cdp.take_events().len(), 2);
+        drop(t.join().unwrap());
+    }
+
+    #[test]
+    fn call_answers_a_dialog_and_still_gets_its_reply() {
+        for accept in [false, true] {
+            let (mut a, mut cdp) = pair();
+            cdp.set_dialog_policy(accept);
+            let t = std::thread::spawn(move || {
+                let req = read_client(&mut a);
+                assert_eq!(req["method"], "Runtime.evaluate");
+                // The page opens a dialog while evaluating (confirm()).
+                write_server(&mut a, &dialog_opening("S", "confirm"));
+                let answer = read_client(&mut a);
+                write_server(&mut a, &json!({"method": "Page.javascriptDialogClosed", "sessionId": "S", "params": {"result": accept}}));
+                write_server(&mut a, &json!({"id": answer["id"], "result": {}, "sessionId": "S"}));
+                write_server(&mut a, &json!({"id": req["id"], "result": {"result": {"type": "boolean", "value": accept}}, "sessionId": "S"}));
+                answer
+            });
+            let r = cdp.call("Runtime.evaluate", json!({"expression": "confirm('x')"}), Some("S"), Some(5.0)).unwrap();
+            assert_eq!(r["result"]["value"], accept);
+            let answer = t.join().unwrap();
+            assert_eq!(answer["method"], "Page.handleJavaScriptDialog");
+            assert_eq!(answer["sessionId"], "S");
+            assert_eq!(answer["params"], json!({"accept": accept}));
+            assert_eq!(cdp.take_dialogs(), vec![Dialog { kind: "confirm".into(), accepted: accept }]);
+            assert!(cdp.take_dialogs().is_empty());
+        }
+    }
+
+    #[test]
+    fn wait_event_answers_a_dialog_and_keeps_waiting() {
+        let (mut a, mut cdp) = pair();
+        cdp.set_dialog_policy(false);
+        let t = std::thread::spawn(move || {
+            // An inline alert() blocks the load event until it is answered.
+            write_server(&mut a, &dialog_opening("S", "alert"));
+            let answer = read_client(&mut a);
+            write_server(&mut a, &json!({"method": "Page.loadEventFired", "sessionId": "S", "params": {}}));
+            answer
+        });
+        let ev = cdp.wait_event("Page.loadEventFired", Some("S"), Some(5.0)).unwrap();
+        assert_eq!(ev["method"], "Page.loadEventFired");
+        assert_eq!(t.join().unwrap()["params"]["accept"], false);
+        assert_eq!(cdp.take_dialogs(), vec![Dialog { kind: "alert".into(), accepted: false }]);
+    }
+
+    #[test]
+    fn without_a_policy_dialogs_are_only_queued() {
+        let (mut a, mut cdp) = pair();
+        let t = std::thread::spawn(move || {
+            let req = read_client(&mut a);
+            write_server(&mut a, &dialog_opening("S", "alert"));
+            write_server(&mut a, &json!({"id": req["id"], "result": {}}));
+            a
+        });
+        cdp.call("Page.enable", json!({}), Some("S"), Some(5.0)).unwrap();
+        assert!(cdp.take_dialogs().is_empty());
+        assert_eq!(cdp.take_events()[0]["method"], "Page.javascriptDialogOpening");
+        drop(t.join().unwrap());
+    }
+
+
+    #[test]
+    fn beforeunload_is_always_accepted() {
+        // Dismissing it would cancel the navigation someone asked for.
+        for policy in [false, true] {
+            let (mut a, mut cdp) = pair();
+            cdp.set_dialog_policy(policy);
+            let t = std::thread::spawn(move || {
+                let req = read_client(&mut a);
+                assert_eq!(req["method"], "Page.navigate");
+                write_server(&mut a, &dialog_opening("S", "beforeunload"));
+                let answer = read_client(&mut a);
+                write_server(&mut a, &json!({"id": req["id"], "result": {"frameId": "F", "loaderId": "L"}, "sessionId": "S"}));
+                answer
+            });
+            cdp.call("Page.navigate", json!({"url": "https://b/"}), Some("S"), Some(5.0)).unwrap();
+            assert_eq!(t.join().unwrap()["params"], json!({"accept": true}), "policy accept={policy}");
+            assert_eq!(cdp.take_dialogs(), vec![Dialog { kind: "beforeunload".into(), accepted: true }]);
+        }
+        assert!(answer_for("beforeunload", false));
+        for kind in ["alert", "confirm", "prompt"] {
+            assert!(!answer_for(kind, false) && answer_for(kind, true), "{kind}");
+        }
+    }
+
 }
