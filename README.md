@@ -133,9 +133,13 @@ sequence of blocking request/response steps with deadlines.
    one; the last line then says so (`{"done": TAB, "reason": ...,
    "still_shown": true}`) instead of `unshown`.
    `tab close` and the output gc stop a tab's viewer. If the viewer
-   event stream (`wayvncctl`) dies while wayvnc runs, it is reopened
-   (without `-w`, so it ends at once if wayvnc is gone) and the unit's
-   state is checked with a backoff (0.5 s up to 5 s), not every poll.
+   event stream (`wayvncctl`) dies while wayvnc runs, before or after a
+   human connected, it is reopened (without `-w`, so it ends at once if
+   wayvnc is gone) and the unit's state is checked with a backoff (0.5 s
+   up to 5 s), not every poll; systemd, not whether a viewer was seen,
+   decides that the viewer is gone. A tab that its browser reports gone is
+   confirmed with that browser only, so an unrelated stalled browser can't
+   keep a closed tab's view waiting.
    `view` gained `--exit-on-disconnect`; reusing a running `view` says
    whether that viewer stops by itself (it keeps the options it was
    started with).

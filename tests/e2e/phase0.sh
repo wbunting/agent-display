@@ -414,6 +414,26 @@ check "the viewer's connect and disconnect are still reported" bash -c "grep -q 
 check "and the view ends on the disconnect (exit 0, unshown)" bash -c "test $src -eq 0 && tail -1 '$E2E_OUT/reopen.jsonl' | grep -q '\"unshown\".*\"reason\": \"disconnected\"'"
 check "no wayvncctl left behind" not pgrep -f "wayvncctl -S $CTL"
 
+echo "-- wayvncctl dies while a human is connected: the view goes on, the real disconnect is reported"
+ad tab show "$A" --wait-viewer --timeout 60 > "$E2E_OUT/midsession.jsonl" 2>&1 &
+SP=$!
+for _ in $(seq 50); do [ -s "$E2E_OUT/midsession.jsonl" ] && break; sleep 0.1; done
+timeout 60 python3 -I "$HERE/rfb.py" "unix:$SOCK" "$E2E_OUT/midsession-frame.png" --hold 6 > "$E2E_OUT/midsession-rfb.out" 2>&1 &
+RP=$!
+for _ in $(seq 50); do grep -q '"viewer": "connected"' "$E2E_OUT/midsession.jsonl" && break; sleep 0.1; done
+pkill -f "wayvncctl -S $CTL -w"
+sleep 1.5
+check "mid-session kill: the show keeps going and the human's viewer stays up" bash -c "kill -0 $SP && test $(active_viewers) -eq 1"
+check "mid-session kill: it doesn't claim the viewer stopped or disconnected" \
+    bash -c "! grep -q '\"viewer\": \"stopped\"\|\"unshown\"\|\"viewer\": \"disconnected\"' '$E2E_OUT/midsession.jsonl'"
+wait "$RP"; rfbrc=$?
+wait "$SP"; src=$?
+cat "$E2E_OUT/midsession.jsonl" | cut -c1-140; echo "[show exit $src; human's client exit $rfbrc: $(tail -1 "$E2E_OUT/midsession-rfb.out" | cut -c1-80)]"
+check "the human finished on their own (not cut off)" test "$rfbrc" -eq 0
+check "their real disconnect was reported and ended the view (exit 0)" \
+    bash -c "test $src -eq 0 && grep -q '\"viewer\": \"disconnected\"' '$E2E_OUT/midsession.jsonl' && tail -1 '$E2E_OUT/midsession.jsonl' | grep -q '\"unshown\".*\"reason\": \"disconnected\"'"
+check "no wayvncctl left behind (mid-session)" not pgrep -f "wayvncctl -S $CTL"
+
 echo "-- two concurrent shows of one tab: one viewer, both see its options"
 ad tab show "$A" > "$E2E_OUT/c1.json" 2>&1 & C1=$!
 ad tab show "$A" > "$E2E_OUT/c2.json" 2>&1 & C2=$!

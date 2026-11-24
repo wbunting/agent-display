@@ -33,8 +33,8 @@ use crate::ctx::*;
 use crate::display::{Wayvnc, display, start_wayvnc, wayvnc_argv};
 use crate::systemd::{is_running, stopping_or_stopped};
 use crate::tab::{
-    Found, GONE_RECHECK, LOOKUP_STEP_TIMEOUT, locate, lookup, no_such_target, output_windows, owned_ports,
-    tab_alive, tab_output, valid_tab_id,
+    Found, LOOKUP_STEP_TIMEOUT, locate, lookup, no_such_target, output_windows, owned_ports, tab_output,
+    valid_tab_id,
 };
 use crate::util::{Error, FileLock, Result, mkdir_private, exit, fmt_g, hex, is_socket, py_repr, random_bytes, unlink_missing_ok, which, write_private};
 use crate::{bail, json};
@@ -605,23 +605,21 @@ fn follow(
                         return end("url-matched", 0);
                     }
                 }
-                Err(e) if no_such_target(&e) => {
-                    ctx.sys.sleep(GONE_RECHECK);
-                    if tab_alive(ctx, tab) == Some(false) {
-                        return gone(port);
-                    }
-                }
                 Err(e) => {
-                    // Look the tab up afresh: at once for a broken connection
-                    // (it never gets better), after STALL_RECHECK of timeouts
-                    // (a busy browser); then at most every STALL_RECHECK
-                    // while no fresh look settles it.
+                    // Look the tab up afresh: at once for "no such target" or a
+                    // broken connection, after STALL_RECHECK of timeouts (a
+                    // busy browser); then at most every STALL_RECHECK while
+                    // no fresh look settles it. "No such target" came from
+                    // the tab's own browser: only that one needs asking (an
+                    // unrelated stalled browser can't keep a closed tab
+                    // open); `locate` confirms the miss ~250 ms later.
                     let now = Instant::now();
                     let stall = Duration::from_secs_f64(STALL_RECHECK);
                     let due = *recheck_at.get_or_insert(if e.is_timeout() { now + stall } else { now });
                     if now >= due {
                         recheck_at = Some(now + stall);
-                        match locate(ctx, tab, port_arg, step) {
+                        let scope = if no_such_target(&e) { Some(port as i64) } else { port_arg };
+                        match locate(ctx, tab, scope, step) {
                             // Answered on a fresh connection: poll on that
                             // one (whether the old one broke or only hangs).
                             Some(Some(f)) => {
@@ -660,7 +658,13 @@ fn follow(
                 // failing) is looked at again later, until the deadline.
                 let state = ctx.sys.unit_active_state(ctx, v.unit);
                 let stopped = state.as_deref().is_some_and(stopping_or_stopped);
-                if seen_viewer || stopped {
+                let running = state.as_deref().is_some_and(is_running);
+                // systemd decides, not whether a viewer was seen: if wayvnc
+                // still runs, only wayvncctl ended (a human may still be
+                // connected), so reopen the stream below. Ended: confirmed
+                // stopped, or a viewer was seen and the unit isn't running
+                // (its last client left and --exit-on-disconnect exited it).
+                if stopped || (seen_viewer && !running) {
                     if until {
                         // Nobody can see the tab any more, but the condition
                         // can still be met: keep watching the tab.
@@ -678,7 +682,7 @@ fn follow(
                 // Back off the state checks meanwhile.
                 next_check = Instant::now() + Duration::from_secs_f64(backoff);
                 backoff = (backoff * 2.0).min(STREAM_BACKOFF_MAX);
-                if state.as_deref().is_some_and(is_running) && Instant::now() >= reopen_at {
+                if running && Instant::now() >= reopen_at {
                     reopen_at = Instant::now() + Duration::from_secs_f64(STREAM_REOPEN);
                     if let Ok(fresh) = ctx.sys.vnc_events(ctx, &viewer_control(ctx, v.output), false) {
                         events = fresh;

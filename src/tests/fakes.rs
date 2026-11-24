@@ -145,6 +145,8 @@ pub struct FakeSys {
     /// Scripted wayvnc viewer events (then Closed); `vnc_events` calls.
     pub vnc_script: RefCell<VecDeque<VncEvent>>,
     pub vnc_opened: RefCell<Vec<PathBuf>>,
+    /// The viewer exited after its last client left (see FakeVnc).
+    pub vnc_exited: std::rc::Rc<std::cell::Cell<bool>>,
     /// The `wait` flag of each vnc_events call.
     pub vnc_waits: RefCell<Vec<bool>>,
     /// Scripts for later vnc_events calls (reopened streams), in order;
@@ -162,7 +164,7 @@ pub struct FakeSys {
     pub real_sleep_cap: Option<f64>,
     /// Raw ActiveState overrides (e.g. "deactivating"); cleared when the
     /// unit is stopped or started.
-    pub raw_state: RefCell<HashMap<String, String>>,
+    pub raw_state: Rc<RefCell<HashMap<String, String>>>,
     /// systemctl can't tell the state of units with this prefix (None).
     pub unknown_prefix: RefCell<Option<String>>,
     /// The next stop_units calls fail (systemctl stop error).
@@ -200,8 +202,11 @@ impl Sys for FakeSys {
             return false;
         }
         let u = unit.trim_end_matches(".service");
-        if u.starts_with("agent-display-vnc-") && self.active_fn.is_none() && !self.started.borrow().contains(u) {
-            return false; // never started: inactive
+        if u.starts_with("agent-display-vnc-")
+            && self.active_fn.is_none()
+            && (!self.started.borrow().contains(u) || self.vnc_exited.get())
+        {
+            return false; // never started, or exited after its last client: inactive
         }
         if let Some(v) = self.active_seq.borrow_mut().pop_front() {
             return v;
@@ -274,6 +279,9 @@ impl Sys for FakeSys {
         self.inactive.borrow_mut().remove(unit.trim_end_matches(".service"));
         self.raw_state.borrow_mut().remove(unit.trim_end_matches(".service"));
         self.started.borrow_mut().insert(unit.trim_end_matches(".service").to_string());
+        if unit.starts_with("agent-display-vnc-") {
+            self.vnc_exited.set(false);
+        }
         // A started wayvnc makes its Unix socket.
         if let Some(i) = argv.iter().position(|a| a == "--unix-socket") {
             let sock = Path::new(&argv[i + 1]);
@@ -327,7 +335,7 @@ impl Sys for FakeSys {
         } else {
             self.vnc_more_scripts.borrow_mut().pop_front().unwrap_or_default().into()
         };
-        Ok(Box::new(FakeVnc(script)))
+        Ok(Box::new(FakeVnc { script, exited: self.vnc_exited.clone() }))
     }
     fn unit_active_state(&self, ctx: &Ctx, unit: &str) -> Option<String> {
         let u = unit.trim_end_matches(".service");
@@ -418,10 +426,23 @@ impl Sys for FakeSys {
     }
 }
 
-pub struct FakeVnc(pub VecDeque<VncEvent>);
+/// A scripted viewer event stream. Like wayvnc with --exit-on-disconnect,
+/// delivering `client-disconnected` with 0 clients makes the viewer exit
+/// (`exited`: its unit then reads inactive until a viewer starts again).
+pub struct FakeVnc {
+    pub script: VecDeque<VncEvent>,
+    pub exited: std::rc::Rc<std::cell::Cell<bool>>,
+}
 impl VncEvents for FakeVnc {
     fn next(&mut self, _timeout: f64) -> VncEvent {
-        self.0.pop_front().unwrap_or(VncEvent::Closed)
+        let ev = self.script.pop_front().unwrap_or(VncEvent::Closed);
+        if let VncEvent::Event(v) = &ev
+            && v["method"] == "client-disconnected"
+            && v["params"]["connection_count"] == 0
+        {
+            self.exited.set(true);
+        }
+        ev
     }
 }
 

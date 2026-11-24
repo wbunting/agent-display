@@ -221,8 +221,10 @@ fn foreground_show_prints_viewer_events_and_ends_when_the_viewer_leaves() {
         json!({"unshown": tab, "reason": "disconnected"}),
     ]);
     assert_eq!(*f.sys.vnc_opened.borrow(), vec![f.t.rt.join("agent-display/vnc/HEADLESS-2.ctl")]);
-    assert!(stopped(&f).contains(&"agent-display-vnc-headless-2".to_string()));
+    // wayvnc exited by itself on the disconnect (--exit-on-disconnect):
+    // nothing left to stop, and its files are cleaned up.
     assert!(!f.t.rt.join("agent-display/vnc/HEADLESS-2.sock").exists());
+    assert!(!f.t.rt.join("agent-display/vnc/HEADLESS-2.json").exists());
 }
 
 #[test]
@@ -457,12 +459,15 @@ fn wait_viewer_alone_still_ends_on_disconnect() {
 fn replace_viewer_after(f: &Fx, n: usize) -> std::path::PathBuf {
     let state = f.t.rt.join("agent-display/vnc/HEADLESS-2.json");
     let st = state.clone();
+    let raw = f.sys.raw_state.clone();
     let mut calls = 0;
     f.b.set_hook(move |m, _| {
         if m == "Target.getTargetInfo" {
             calls += 1;
             if calls == n {
                 std::fs::write(&st, r#"{"view_only": false, "expires": 9999999999.0, "token": "othershow0000000"}"#).unwrap();
+                // The other show's viewer runs on the same unit name.
+                raw.borrow_mut().insert("agent-display-vnc-headless-2".into(), "active".into());
             }
         }
         Hook::Pass
@@ -1386,4 +1391,87 @@ fn view_steps_are_bounded_by_its_deadline() {
     // The fresh look's connects (after show's own lookup).
     let looks: Vec<f64> = f.sys.version_timeouts.borrow().iter().skip(1).copied().collect();
     assert!(!looks.is_empty() && looks.iter().all(|t| *t <= 2.0), "{looks:?}");
+}
+
+// ------------------------------------------------------------ round 11
+// wayvncctl dying while a human is connected: systemd, not "a viewer was
+// seen", decides whether the view is over.
+
+#[test]
+fn wayvncctl_dying_mid_session_reopens_and_reports_the_real_disconnect() {
+    let mut f = fx();
+    f.sys.real_sleep_cap = Some(0.01);
+    let (tab, _) = opened(&f);
+    // The human is connected; wayvncctl dies (wayvnc runs on).
+    f.sys.vnc_script.borrow_mut().extend([ev("client-connected", 1), VncEvent::Closed]);
+    f.sys.vnc_more_scripts.borrow_mut().push_back(vec![VncEvent::Idle, ev("client-disconnected", 0)]);
+    let (code, out, err) = f.cli(&["show", "--wait-viewer", "--timeout", "5", &tab]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(&lines(&out)[1..], &[
+        json!({"viewer": "connected", "clients": 1}),
+        json!({"viewer": "disconnected", "clients": 0}),
+        json!({"unshown": tab, "reason": "disconnected"}),
+    ]);
+    assert_eq!(*f.sys.vnc_waits.borrow(), vec![true, false], "reopened without -w");
+    // Never stopped while the human was on it: wayvnc exited by itself
+    // after the real disconnect.
+    assert!(stopped(&f).is_empty(), "{:?}", stopped(&f));
+}
+
+#[test]
+fn wayvncctl_dying_mid_session_under_until_url_doesnt_claim_the_viewer_stopped() {
+    let mut f = fx();
+    f.sys.real_sleep_cap = Some(0.01);
+    let (tab, _) = opened(&f);
+    let t2 = tab.clone();
+    let mut n = 0;
+    f.b.set_hook(move |m, _| {
+        if m == "Target.getTargetInfo" {
+            n += 1;
+            if n >= 8 {
+                return Hook::Return(Ok(json!({"targetInfo": {"targetId": t2, "type": "page",
+                    "url": "https://bank.example/home", "title": ""}})));
+            }
+        }
+        Hook::Pass
+    });
+    f.sys.vnc_script.borrow_mut().extend([ev("client-connected", 1), VncEvent::Closed]);
+    let (code, out, err) = f.cli(&["show", "--until-url", "/home", "--timeout", "10", &tab]);
+    assert_eq!(code, 0, "{err}");
+    let l = lines(&out);
+    assert!(!l.contains(&json!({"viewer": "stopped"})), "the viewer never stopped: {l:?}");
+    assert_eq!(l.last().unwrap(), &json!({"unshown": tab, "reason": "url-matched"}));
+    assert!(f.sys.vnc_waits.borrow().iter().skip(1).all(|w| !*w));
+    assert!(f.sys.vnc_waits.borrow().len() >= 2, "stream reopened");
+}
+
+#[test]
+fn closed_tab_ends_until_closed_even_with_another_browser_stalled() {
+    // The tab's own browser says "no such target"; an unrelated registered
+    // browser is stalled. Ask only the tab's browser: closed (0) at once,
+    // not a timeout because the other browser can't answer.
+    let mut f = fx();
+    f.sys.real_sleep_cap = Some(0.01);
+    *f.sys.browsers.borrow_mut() =
+        Some(vec![info("agent-display-browser-tmp-a", 9001), info("agent-display-browser", 9425)]);
+    f.sys_version_fail(|port| (port == 9001).then(|| Error::os("timed out")));
+    let (tab, _) = opened(&f);
+    let b = f.b.clone();
+    let t2 = tab.clone();
+    let mut n = 0;
+    f.b.set_hook(move |m, _| {
+        if m == "Target.getTargetInfo" {
+            n += 1;
+            if n == 2 {
+                b.st().targets.retain(|(k, _)| *k != t2); // closed after show's lookup
+            }
+        }
+        Hook::Pass
+    });
+    f.sys.vnc_script.borrow_mut().extend(std::iter::repeat_n(VncEvent::Idle, 200));
+    let t0 = std::time::Instant::now();
+    let (code, out, err) = f.cli(&["show", "--until-closed", "--timeout", "10", &tab]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(lines(&out).last().unwrap(), &json!({"unshown": tab, "reason": "closed"}));
+    assert!(t0.elapsed().as_secs_f64() < 3.0, "{:?}", t0.elapsed());
 }
