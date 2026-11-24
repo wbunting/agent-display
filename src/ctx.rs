@@ -156,6 +156,10 @@ pub trait Sys {
     fn units_active(&self, ctx: &Ctx, units: &[String]) -> Vec<Option<bool>> {
         systemd::units_active(ctx, units)
     }
+    /// Raw ActiveState, None if systemctl couldn't tell (see systemd.rs).
+    fn unit_active_state(&self, ctx: &Ctx, unit: &str) -> Option<String> {
+        systemd::unit_active_state(ctx, unit)
+    }
     /// The unit's cgroup path (`ControlGroup`), if it has one.
     fn unit_cgroup(&self, ctx: &Ctx, unit: &str) -> Option<String> {
         systemd::unit_cgroup(ctx, unit)

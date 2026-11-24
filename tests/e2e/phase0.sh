@@ -334,6 +334,18 @@ run ad_flaky tab unshow "$A"
 check "state unknown, stop works: unshow stops it (was_shown true)" bash -c "test $rc -eq 0 && test $(active_viewers) -eq 0"
 check "and only then removes its files" test ! -e "$SOCK" -a ! -e "$E2E_ROOT/run/agent-display/vnc/$AO.json"
 
+echo "-- systemctl can't tell a viewer's state: a second show leaves the running viewer alone"
+ad tab show "$A" >/dev/null
+TOK=$(jq -r .token "$E2E_ROOT/run/agent-display/vnc/$AO.json")
+run ad_flaky tab show "$A"
+check "second show with the state unknown: exit 75" test "$rc" -eq 75
+check "the running viewer still runs, socket in place" test "$(active_viewers)" -eq 1 -a -S "$SOCK"
+check "its state and token are untouched" test "$(jq -r .token "$E2E_ROOT/run/agent-display/vnc/$AO.json" 2>/dev/null)" = "$TOK" -a "${#TOK}" -eq 16
+run timeout 30 python3 -I "$HERE/rfb.py" "unix:$SOCK" "$E2E_OUT/unknown-still-up.png" --hold 0.3
+check "a human can still connect to it" test "$rc" -eq 0
+sleep 1
+ad tab unshow "$A" >/dev/null
+
 echo "-- a running viewer whose files were lost: unshow finds it"
 ad tab show "$A" >/dev/null
 rm -f "$SOCK" "$E2E_ROOT/run/agent-display/vnc/$AO.json" "$E2E_ROOT/run/agent-display/vnc/$AO.ctl"

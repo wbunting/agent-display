@@ -301,7 +301,30 @@ pub fn cmd_tab_show(ctx: &Ctx, o: &TabOpts, tab: &str, s: &ShowOpts) -> Result<i
     let sock = viewer_socket(ctx, &output);
     // Released when the decision and any start are done (before following).
     let lock = ViewerLock::acquire(ctx, &output)?;
-    let running = ctx.sys.unit_active(ctx, &unit) && is_socket(&sock);
+    // Unknown is not "not running": never start over (and unlink) a viewer
+    // that may be someone else's. Stopping or stopped: start (start_wayvnc
+    // waits out a stopping unit).
+    let has_files = [&sock, &viewer_control(ctx, &output), &viewer_state(ctx, &output)].iter().any(|f| f.exists());
+    let running = match ctx.sys.unit_active_state(ctx, &unit).as_deref() {
+        Some("active" | "reloading" | "refreshing") if is_socket(&sock) => true,
+        Some("active" | "reloading" | "refreshing") => {
+            return Err(Error::new(format!(
+                "a viewer of {output} is running without its socket; `agent-display tab unshow {tab}` first"
+            ))
+            .with_code(exit::TEMPFAIL));
+        }
+        Some("deactivating" | "inactive" | "failed") => false,
+        // Unknown (systemctl failed) or starting: fine only if nothing of a
+        // viewer is here; systemd-run still refuses a loaded unit.
+        _ if !has_files => false,
+        state => {
+            let why = state.map(|s| format!("it is {s}")).unwrap_or_else(|| "systemctl failed".into());
+            return Err(Error::new(format!(
+                "can't tell whether the viewer of {output} is running ({why}); try again"
+            ))
+            .with_code(exit::TEMPFAIL));
+        }
+    };
     // The token of the viewer this call starts (None: someone else's).
     let mut token: Option<String> = None;
     // When the view ends: ours from --timeout, or the running viewer's.

@@ -113,6 +113,19 @@ pub fn unit_active(ctx: &Ctx, name: &str) -> bool {
     unit_state(ctx, name) == Some(true)
 }
 
+/// The unit's raw ActiveState (`active`, `deactivating`, ...), or None if
+/// systemctl failed or timed out (unknown). For decisions that must tell a
+/// stopping unit from one whose state can't be read.
+pub fn unit_active_state(ctx: &Ctx, name: &str) -> Option<String> {
+    let unit = unit_name(name);
+    let blocks = show(ctx, std::slice::from_ref(&unit))?;
+    let (id, state, info) = blocks.into_iter().find(|(id, _, _)| *id == unit)?;
+    if let Some(info) = info {
+        ctx.units.borrow_mut().insert(id, info);
+    }
+    (!state.is_empty()).then_some(state)
+}
+
 /// `units_active` for one unit.
 pub fn unit_state(ctx: &Ctx, name: &str) -> Option<bool> {
     ctx.sys.units_active(ctx, &[name.to_string()]).first().copied().flatten()

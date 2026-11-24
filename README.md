@@ -105,7 +105,10 @@ sequence of blocking request/response steps with deadlines.
    unknown unit state as possibly running: it stops the unit and removes
    the viewer's files only once that worked (a failed stop is 75 for
    `unshow`, and the files stay for a retry). `unshow` also finds a running
-   viewer whose files were lost. On someone else's viewer, `--wait-viewer` ends by its expiry
+   viewer whose files were lost. Starting follows the same rule: a `show`
+   that can't read the viewer unit's state while a viewer's files exist
+   exits 75 instead of starting over it, and a stopping unit (systemd says
+   `deactivating`) is waited out, never one whose state is unknown. On someone else's viewer, `--wait-viewer` ends by its expiry
    at the latest; `--until-*` wait their own `--timeout`.
    `--wait-viewer`, `--until-url REGEX` and `--until-closed` keep it in the
    foreground, printing `{"viewer": "connected"}` / `"disconnected"` JSON

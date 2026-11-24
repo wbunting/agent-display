@@ -169,16 +169,9 @@ fn viewer_killed_by_its_own_timer_at_the_deadline_is_a_timeout() {
     // normal stop.
     let mut f = fx();
     let (tab, _) = opened(&f);
-    let starts = std::rc::Rc::new(std::cell::Cell::new(0));
-    let s2 = starts.clone();
-    // Active while show starts it (socket check), inactive once it is "killed".
-    f.sys.active_fn = Some(Box::new(move |u| {
-        if !u.starts_with("agent-display-vnc-") {
-            return true;
-        }
-        s2.set(s2.get() + 1);
-        s2.get() <= 1
-    }));
+    // Inactive before the start (never started) and after it is "killed";
+    // the start itself is seen through its socket.
+    f.sys.active_fn = Some(Box::new(|u| !u.starts_with("agent-display-vnc-")));
     f.sys.active = None;
     f.sys.vnc_script.borrow_mut().extend([ev("client-connected", 1), VncEvent::Closed]);
     let (code, out, err) = f.cli(&["show", "--wait-viewer", "--timeout", "0.5", &tab]);
@@ -533,7 +526,7 @@ fn reshow_never_stops_a_viewer_that_is_already_running() {
     f.sys.active = None;
     let (code, _, err) = f.cli(&["show", &tab]);
     assert_eq!(code, 75, "{err}");
-    assert!(err.contains("is already running (started by another call, or a viewer whose files are gone); try again"), "{err}");
+    assert!(err.contains("may already be running (it is active); try again"), "{err}");
     assert!(stopped(&f).is_empty(), "{:?}", stopped(&f));
 }
 
@@ -898,4 +891,81 @@ fn stalled_polls_are_busy_not_gone() {
     // Within STALL_RECHECK a timeout is just busy: no fresh lookups, only
     // the one connection the show's own lookup made.
     assert_eq!(*f.sys.version_calls.borrow() - before, 1);
+}
+
+// ------------------------------------------------------------ round 6
+// Starting a viewer never treats an unknown state as "no viewer".
+
+fn token_of(f: &Fx) -> Option<String> {
+    let st: Value = serde_json::from_str(&std::fs::read_to_string(f.t.rt.join("agent-display/vnc/HEADLESS-2.json")).ok()?).ok()?;
+    st["token"].as_str().map(String::from)
+}
+
+#[test]
+fn show_never_starts_over_a_viewer_whose_state_is_unknown() {
+    // The reviewer's case: someone's viewer runs, systemctl can't answer;
+    // a second show must not unlink its files or stop it: 75, untouched.
+    let f = fx();
+    let (tab, _) = opened(&f);
+    assert_eq!(f.cli(&["show", &tab]).0, 0);
+    let token = token_of(&f).unwrap();
+    *f.sys.unknown_prefix.borrow_mut() = Some("agent-display-vnc-".into());
+    let (code, out, err) = f.cli(&["show", &tab]);
+    assert_eq!((code, out.as_str()), (75, ""), "{err}");
+    assert!(err.contains("can't tell whether the viewer of HEADLESS-2 is running (systemctl failed); try again"), "{err}");
+    assert_eq!(token_of(&f).as_deref(), Some(token.as_str()), "its state and token stay");
+    assert!(f.t.rt.join("agent-display/vnc/HEADLESS-2.sock").exists());
+    assert!(stopped(&f).is_empty(), "{:?}", stopped(&f));
+    assert_eq!(viewer_runs(&f).len(), 1, "no second start");
+    // systemctl answers again: the viewer is reused.
+    *f.sys.unknown_prefix.borrow_mut() = None;
+    let (code, out, _) = f.cli(&["show", &tab]);
+    assert_eq!(code, 0);
+    assert_eq!(lines(&out)[0]["already_shown"], true);
+}
+
+#[test]
+fn already_loaded_with_an_unknown_state_is_75_not_a_stop() {
+    // No files of ours, state unknown, yet systemd-run says the unit is
+    // loaded: something runs there. Don't stop it.
+    let f = fx();
+    let (tab, _) = opened(&f);
+    *f.sys.unknown_prefix.borrow_mut() = Some("agent-display-vnc-".into());
+    *f.sys.run_still_loaded.borrow_mut() = 1;
+    let (code, _, err) = f.cli(&["show", &tab]);
+    assert_eq!(code, 75, "{err}");
+    assert!(err.contains("may already be running (its state can't be read (systemctl failed))"), "{err}");
+    assert!(stopped(&f).is_empty(), "{:?}", stopped(&f));
+}
+
+#[test]
+fn reshow_while_the_old_viewer_is_deactivating_waits_it_out() {
+    // A stopping unit (not unknown) is still "start": wait it out, retry.
+    let f = fx();
+    let (tab, _) = opened(&f);
+    assert_eq!(f.cli(&["show", &tab]).0, 0);
+    f.sys.raw_state.borrow_mut().insert("agent-display-vnc-headless-2".into(), "deactivating".into());
+    *f.sys.run_still_loaded.borrow_mut() = 1;
+    let (code, out, err) = f.cli(&["show", &tab]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(lines(&out)[0]["already_shown"], false);
+    assert_eq!(stopped(&f), vec!["agent-display-vnc-headless-2"], "waited out the old unit");
+    assert_eq!(token_of(&f).map(|t| t.len()), Some(16));
+}
+
+#[test]
+fn active_viewer_without_its_socket_is_left_alone() {
+    let f = fx();
+    let (tab, _) = opened(&f);
+    assert_eq!(f.cli(&["show", &tab]).0, 0);
+    let token = token_of(&f).unwrap();
+    std::fs::remove_file(f.t.rt.join("agent-display/vnc/HEADLESS-2.sock")).unwrap();
+    let (code, _, err) = f.cli(&["show", &tab]);
+    assert_eq!(code, 75, "{err}");
+    assert!(err.contains("running without its socket; `agent-display tab unshow"), "{err}");
+    assert_eq!(token_of(&f).as_deref(), Some(token.as_str()));
+    assert!(stopped(&f).is_empty());
+    // unshow then stops it, and a show starts afresh.
+    assert_eq!(f.cli(&["unshow", &tab]).0, 0);
+    assert_eq!(f.cli(&["show", &tab]).0, 0);
 }
