@@ -43,12 +43,15 @@ pub struct UnitInfo {
     pub main_pid: u32,
 }
 
-fn show(ctx: &Ctx, units: &[String]) -> Vec<(String, String, Option<UnitInfo>)> {
+/// `systemctl show` blocks (id, ActiveState, cgroup/pid), or None if
+/// systemctl itself failed or timed out: then nothing is known about any of
+/// the units, which is not the same as "inactive".
+fn show(ctx: &Ctx, units: &[String]) -> Option<Vec<(String, String, Option<UnitInfo>)>> {
     let mut argv: Vec<String> = ["systemctl", "--user", "show", "-p", "Id", "-p", "ActiveState", "-p", "ControlGroup", "-p", "MainPID"]
         .map(String::from)
         .to_vec();
     argv.extend(units.iter().cloned());
-    let out = ctx.sys.run(ctx, &argv, None, Some(15.0), false).unwrap_or_default();
+    let out = ctx.sys.run(ctx, &argv, None, Some(15.0), true).ok()?;
     let mut blocks = Vec::new();
     for block in out.split("\n\n") {
         let (mut id, mut state, mut cg, mut pid) = (String::new(), String::new(), String::new(), 0u32);
@@ -66,18 +69,46 @@ fn show(ctx: &Ctx, units: &[String]) -> Vec<(String, String, Option<UnitInfo>)> 
             blocks.push((id, state, info));
         }
     }
-    blocks
+    Some(blocks)
+}
+
+/// What an ActiveState says about whether the unit runs: `Some(true)`
+/// active, `Some(false)` confirmed stopped (`inactive`, `failed`; a unit
+/// systemd doesn't know is `inactive` too), `None` in between
+/// (`activating`, `deactivating`, ...).
+pub fn state_active(state: &str) -> Option<bool> {
+    match state {
+        "active" | "reloading" | "refreshing" => Some(true),
+        "inactive" | "failed" => Some(false),
+        _ => None,
+    }
+}
+
+/// ActiveState says the unit runs (`active`, `reloading`, `refreshing`).
+pub fn is_running(state: &str) -> bool {
+    state_active(state) == Some(true)
+}
+
+/// ActiveState says the unit is stopped (`inactive`, `failed`) or on its way
+/// there (`deactivating`). Anything else, including an unknown state, may
+/// still run.
+pub fn stopping_or_stopped(state: &str) -> bool {
+    state == "deactivating" || state_active(state) == Some(false)
 }
 
 /// ActiveState of several units in one `systemctl show` (the Python runs
 /// `systemctl is-active` per unit). Cgroup and main pid are remembered for
-/// the ownership check later in this process.
-pub fn units_active(ctx: &Ctx, names: &[String]) -> Vec<bool> {
+/// the ownership check later in this process. `None` for a unit means
+/// unknown: systemctl failed or timed out, or the unit is in transition.
+/// Callers must not treat unknown as stopped (e.g. delete its state).
+pub fn units_active(ctx: &Ctx, names: &[String]) -> Vec<Option<bool>> {
     if names.is_empty() {
         return vec![];
     }
     let units: Vec<String> = names.iter().map(|n| unit_name(n)).collect();
-    let blocks = show(ctx, &units);
+    let Some(blocks) = show(ctx, &units) else {
+        return vec![None; units.len()];
+    };
     for (id, _, info) in &blocks {
         if let Some(info) = info {
             ctx.units.borrow_mut().insert(id.clone(), info.clone());
@@ -85,12 +116,31 @@ pub fn units_active(ctx: &Ctx, names: &[String]) -> Vec<bool> {
     }
     units
         .iter()
-        .map(|u| blocks.iter().any(|(id, state, _)| id == u && state == "active"))
+        .map(|u| blocks.iter().find(|(id, _, _)| id == u).and_then(|(_, state, _)| state_active(state)))
         .collect()
 }
 
+/// Whether the unit is active; unknown counts as not active.
 pub fn unit_active(ctx: &Ctx, name: &str) -> bool {
-    ctx.sys.units_active(ctx, &[name.to_string()]).first().copied().unwrap_or(false)
+    unit_state(ctx, name) == Some(true)
+}
+
+/// The unit's raw ActiveState (`active`, `deactivating`, ...), or None if
+/// systemctl failed or timed out (unknown). For decisions that must tell a
+/// stopping unit from one whose state can't be read.
+pub fn unit_active_state(ctx: &Ctx, name: &str) -> Option<String> {
+    let unit = unit_name(name);
+    let blocks = show(ctx, std::slice::from_ref(&unit))?;
+    let (id, state, info) = blocks.into_iter().find(|(id, _, _)| *id == unit)?;
+    if let Some(info) = info {
+        ctx.units.borrow_mut().insert(id, info);
+    }
+    (!state.is_empty()).then_some(state)
+}
+
+/// `units_active` for one unit.
+pub fn unit_state(ctx: &Ctx, name: &str) -> Option<bool> {
+    ctx.sys.units_active(ctx, &[name.to_string()]).first().copied().flatten()
 }
 
 pub fn unit_cgroup(ctx: &Ctx, name: &str) -> Option<String> {
@@ -98,7 +148,7 @@ pub fn unit_cgroup(ctx: &Ctx, name: &str) -> Option<String> {
     if let Some(info) = ctx.units.borrow().get(&unit) {
         return Some(info.cgroup.clone());
     }
-    let (_, _, info) = show(ctx, std::slice::from_ref(&unit)).into_iter().find(|(id, _, _)| *id == unit)?;
+    let (_, _, info) = show(ctx, std::slice::from_ref(&unit))?.into_iter().find(|(id, _, _)| *id == unit)?;
     let info = info?;
     ctx.units.borrow_mut().insert(unit, info.clone());
     Some(info.cgroup)

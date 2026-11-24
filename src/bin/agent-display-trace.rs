@@ -34,7 +34,7 @@ impl Sys for TracingSys {
     fn unit_active(&self, ctx: &Ctx, unit: &str) -> bool {
         systemd::unit_active(ctx, unit) // its systemctl is timed via run()
     }
-    fn units_active(&self, ctx: &Ctx, units: &[String]) -> Vec<bool> {
+    fn units_active(&self, ctx: &Ctx, units: &[String]) -> Vec<Option<bool>> {
         systemd::units_active(ctx, units)
     }
     fn unit_cgroup(&self, ctx: &Ctx, unit: &str) -> Option<String> {
@@ -48,6 +48,13 @@ impl Sys for TracingSys {
         // is not counted as the /proc scan.
         let _ = ctx.sys.unit_cgroup(ctx, unit);
         self.0.time("listener check (/proc)", || net::listener_in_unit(ctx, port, unit))
+    }
+    fn listener_owner(&self, ctx: &Ctx, port: u16, unit: &str) -> Option<net::Owner> {
+        let _ = ctx.sys.unit_cgroup(ctx, unit);
+        self.0.time("listener scan (cgroup + /proc)", || net::listener_owner(ctx, port, unit))
+    }
+    fn owner_valid(&self, owner: &net::Owner, unit: &str) -> bool {
+        self.0.time("owner re-check (/proc)", || net::owner_valid(owner, unit))
     }
     fn cdp_version(&self, port: u16, timeout: f64) -> Result<Value> {
         self.0.time("HTTP /json/version", || cdp::cdp_version(port, timeout))

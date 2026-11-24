@@ -51,6 +51,8 @@ pub fn install_hint(tool: &str) -> &'static str {
         "grim" => "needed by screenshot",
         "wtype" => "needed by type/key",
         "wayvnc" => "needed by view",
+        "wayvncctl" => "installed with wayvnc",
+        "timeout" => "from coreutils",
         _ => "not installed",
     }
 }
@@ -149,9 +151,14 @@ pub trait Sys {
     fn unit_active(&self, ctx: &Ctx, unit: &str) -> bool {
         systemd::unit_active(ctx, unit)
     }
-    /// Several units in one systemctl call.
-    fn units_active(&self, ctx: &Ctx, units: &[String]) -> Vec<bool> {
+    /// Several units in one systemctl call: `Some(active)`, or `None` when
+    /// unknown (systemctl failed, or the unit is starting or stopping).
+    fn units_active(&self, ctx: &Ctx, units: &[String]) -> Vec<Option<bool>> {
         systemd::units_active(ctx, units)
+    }
+    /// Raw ActiveState, None if systemctl couldn't tell (see systemd.rs).
+    fn unit_active_state(&self, ctx: &Ctx, unit: &str) -> Option<String> {
+        systemd::unit_active_state(ctx, unit)
     }
     /// The unit's cgroup path (`ControlGroup`), if it has one.
     fn unit_cgroup(&self, ctx: &Ctx, unit: &str) -> Option<String> {
@@ -169,6 +176,14 @@ pub trait Sys {
     /// The LISTEN socket on `port` is held by a process inside `unit`.
     fn listener_in_unit(&self, ctx: &Ctx, port: u16, unit: &str) -> bool {
         net::listener_in_unit(ctx, port, unit)
+    }
+    /// That process and socket (systemd cgroup + /proc scan), or None.
+    fn listener_owner(&self, ctx: &Ctx, port: u16, unit: &str) -> Option<net::Owner> {
+        net::listener_owner(ctx, port, unit)
+    }
+    /// Re-check a remembered owner from /proc alone (no systemd).
+    fn owner_valid(&self, owner: &net::Owner, unit: &str) -> bool {
+        net::owner_valid(owner, unit)
     }
     fn pid_in_unit(&self, pid: u32, unit: &str) -> bool {
         net::pid_in_unit(pid, unit)
@@ -199,6 +214,12 @@ pub trait Sys {
     }
     fn find_window(&self, ctx: &Ctx, disp: &Disp, title: &str, timeout: f64) -> Option<Window> {
         crate::tab::find_window_real(ctx, disp, title, timeout)
+    }
+    /// Viewer events of the wayvnc behind control socket `ctl`.
+    /// `wait`: wait for the control socket to appear (a viewer just
+    /// started); otherwise fail at once if wayvnc isn't there.
+    fn vnc_events(&self, ctx: &Ctx, ctl: &Path, wait: bool) -> Result<Box<dyn crate::show::VncEvents>> {
+        crate::show::vnc_events_real(ctx, ctl, wait)
     }
     fn sleep(&self, secs: f64) {
         std::thread::sleep(std::time::Duration::from_secs_f64(secs.max(0.0)));
@@ -294,6 +315,11 @@ impl<'a> Ctx<'a> {
 
     pub fn tab_outputs_dir(&self) -> PathBuf {
         self.runtime_dir().join("tab-outputs")
+    }
+
+    /// Unix sockets of per-tab viewers (`tab show`).
+    pub fn vnc_dir(&self) -> PathBuf {
+        self.runtime_dir().join("vnc")
     }
 
     /// Caller environment minus anything that points at the user's desktop.

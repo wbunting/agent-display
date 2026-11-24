@@ -58,13 +58,9 @@ pub fn dbus_config(runtime: &Path) -> String {
 }
 
 pub fn ensure_runtime_dir(ctx: &Ctx) -> Result<PathBuf> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    use std::os::unix::fs::MetadataExt;
     let rt = ctx.runtime_dir();
-    match std::fs::DirBuilder::new().mode(0o700).create(&rt) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(e.into()),
-    }
+    crate::util::mkdir_private(&rt)?;
     let st = std::fs::metadata(&rt)?;
     if st.uid() != ctx.uid || st.mode() & 0o077 != 0 {
         bail!("{} must be owned by you with mode 0700", rt.display());
@@ -281,13 +277,14 @@ pub fn cmd_stop(ctx: &Ctx) -> Result<i32> {
     let disp: Vec<String> = rest.iter().filter(|u| *u == DISPLAY_UNIT).cloned().collect();
     ctx.sys.stop_units(ctx, &disp)?;
     let rt = ctx.runtime_dir();
-    for name in ["env", "env.tmp", "vnc.port"] {
+    for name in ["env", "env.tmp", "vnc.port", "vnc.exit-on-disconnect"] {
         unlink_missing_ok(&rt.join(name));
     }
     let _ = std::fs::remove_dir_all(ctx.tab_outputs_dir());
+    let _ = std::fs::remove_dir_all(ctx.vnc_dir());
     if let Ok(rd) = std::fs::read_dir(ctx.browsers_dir()) {
         for e in rd.flatten() {
-            if e.path().extension().is_some_and(|x| x == "json") {
+            if e.path().extension().is_some_and(|x| x == "json" || x == "owner") {
                 unlink_missing_ok(&e.path());
             }
         }
@@ -536,11 +533,115 @@ pub fn cmd_hold_input(ctx: &Ctx) -> Result<i32> {
 
 // ------------------------------------------------------------ viewer
 
-pub fn cmd_view(ctx: &Ctx, mut port: i64, view_only: bool) -> Result<i32> {
+/// What a wayvnc on the agent display serves and how (`view`, `tab show`).
+pub struct Wayvnc<'a> {
+    /// The one output it captures.
+    pub output: &'a str,
+    /// Its control socket (`wayvncctl -S`).
+    pub ctl: &'a Path,
+    /// Desktop name shown by viewers.
+    pub name: &'a str,
+    pub view_only: bool,
+    pub exit_on_disconnect: bool,
+    /// Trailing arguments: `ADDRESS PORT` or `--unix-socket PATH`.
+    pub listen: &'a [String],
+}
+
+/// argv for a wayvnc unit: the agent display's minimal env, `prefix` (e.g.
+/// a `timeout` wrapper), then wayvnc with an empty config (never the
+/// user's ~/.config/wayvnc: their tailnet listener and credentials), its
+/// own control socket, one output and no resizing.
+pub fn wayvnc_argv(ctx: &Ctx, disp: &Disp, prefix: &[String], w: &Wayvnc) -> Result<Vec<String>> {
+    let wayvnc = which("wayvnc", &ctx.env).ok_or_else(|| Error::new(format!("wayvnc not found ({})", install_hint("wayvnc"))))?;
+    let config = ctx.runtime_dir().join("wayvnc.config");
+    write_private(&config, "")?;
+    let mut argv = env_argv(&ctx.minimal_env(disp));
+    argv.extend(prefix.iter().cloned());
+    argv.push(wayvnc.to_string_lossy().into());
+    if w.view_only {
+        argv.push("--disable-input".into());
+    }
+    if w.exit_on_disconnect {
+        argv.push("--exit-on-disconnect".into());
+    }
+    argv.extend([
+        format!("--config={}", config.display()),
+        format!("--socket={}", w.ctl.display()),
+        format!("--output={}", w.output),
+        "--disable-resizing".into(),
+        "--render-cursor".into(),
+        format!("--name={}", w.name),
+    ]);
+    argv.extend(w.listen.iter().cloned());
+    Ok(argv)
+}
+
+/// Run `argv` as `unit` (bound to the display) and wait up to 10 s for
+/// `ready`. If it never gets ready, stop the unit and fail with its log.
+///
+/// A viewer that just exited (its last client left) keeps its transient
+/// unit loaded while ExecStopPost runs, and systemd-run refuses the name
+/// meanwhile: if systemd confirms the unit is stopping or stopped, wait
+/// that out (stop it, which waits for the stop to finish) and retry for up
+/// to ~5 s. Otherwise (active, starting, or its state unknown because
+/// systemctl failed) a viewer may run there: leave it alone and fail with
+/// 75 (try again; `tab unshow` stops a lost one).
+pub fn start_wayvnc(ctx: &Ctx, unit: &str, argv: &[String], stop_post: Option<&[String]>, description: &str, ready: &dyn Fn() -> bool) -> Result<()> {
+    let mut tries = 0;
+    loop {
+        match ctx.sys.systemd_run(ctx, unit, argv, true, stop_post, Some(description)) {
+            Ok(()) => break,
+            Err(e) if e.msg.contains("already loaded") && tries < 25 => {
+                tries += 1;
+                match ctx.sys.unit_active_state(ctx, unit).as_deref() {
+                    Some(s) if crate::systemd::stopping_or_stopped(s) => {
+                        let _ = ctx.sys.stop_units(ctx, &[unit.to_string()]);
+                        ctx.sys.sleep(0.2);
+                    }
+                    state => {
+                        let why = match state {
+                            None => "its state can't be read (systemctl failed)".to_string(),
+                            Some(s) => format!("it is {s}"),
+                        };
+                        return Err(Error::new(format!(
+                            "{unit} may already be running ({why}); try again, or stop it with \
+                             `agent-display tab unshow` / `agent-display unview`"
+                        ))
+                        .with_code(crate::util::exit::TEMPFAIL));
+                    }
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready() {
+        // Gives up early only on a confirmed stop: an unknown state waits.
+        let stopped = || {
+            ctx.sys.unit_active_state(ctx, unit).as_deref().map(crate::systemd::state_active) == Some(Some(false))
+        };
+        if Instant::now() > deadline || stopped() {
+            let log = journal_tail(ctx, unit, 12);
+            let _ = ctx.sys.stop_units(ctx, &[unit.to_string()]);
+            bail!("wayvnc did not start:\n{log}");
+        }
+        ctx.sys.sleep(0.05);
+    }
+    Ok(())
+}
+
+/// Marks a running `view` viewer that was started with --exit-on-disconnect
+/// (so a later `view` reusing it can say whether it stops by itself).
+fn view_exits_marker(ctx: &Ctx) -> PathBuf {
+    ctx.runtime_dir().join("vnc.exit-on-disconnect")
+}
+
+pub fn cmd_view(ctx: &Ctx, mut port: i64, view_only: bool, exit_on_disconnect: bool) -> Result<i32> {
     require(ctx, &["wayvnc"])?;
     let disp = display(ctx)?;
     let port_file = ctx.runtime_dir().join("vnc.port");
-    if ctx.sys.unit_active(ctx, VNC_UNIT) {
+    let reused = ctx.sys.unit_active(ctx, VNC_UNIT);
+    if reused {
         let current = std::fs::read_to_string(&port_file).ok().and_then(|s| s.trim().parse::<i64>().ok());
         let Some(current) = current else {
             bail!("{VNC_UNIT} is running on an unknown port; run `agent-display unview` first");
@@ -551,38 +652,36 @@ pub fn cmd_view(ctx: &Ctx, mut port: i64, view_only: bool) -> Result<i32> {
         port = current;
     } else {
         browser::check_port(ctx, port, RESERVED_VNC_PORTS)?;
-        let rt = ctx.runtime_dir();
-        // Empty config: never inherit ~/.config/wayvnc (the user's own
-        // tailnet listener, credentials). Separate control socket too.
-        write_private(&rt.join("wayvnc.config"), "")?;
-        let mut argv = env_argv(&ctx.minimal_env(&disp));
-        argv.push(which("wayvnc", &ctx.env).unwrap().to_string_lossy().into());
-        if view_only {
-            argv.push("--disable-input".into());
-        }
-        argv.extend([
-            format!("--config={}", rt.join("wayvnc.config").display()),
-            format!("--socket={}", rt.join("wayvncctl").display()),
-            format!("--output={OUTPUT}"),
-            "--disable-resizing".into(),
-            "--render-cursor".into(),
-            "--name=agent-display".into(),
-            "127.0.0.1".into(),
-            port.to_string(),
-        ]);
-        ctx.sys.systemd_run(ctx, VNC_UNIT, &argv, true, None, Some("Agent display VNC viewer (loopback)"))?;
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !ctx.sys.listener_in_unit(ctx, port as u16, &unit_name(VNC_UNIT)) {
-            if Instant::now() > deadline || !ctx.sys.unit_active(ctx, VNC_UNIT) {
-                bail!("wayvnc did not start:\n{}", journal_tail(ctx, VNC_UNIT, 12));
-            }
-            ctx.sys.sleep(0.2);
-        }
+        let argv = wayvnc_argv(ctx, &disp, &[], &Wayvnc {
+            output: OUTPUT,
+            ctl: &ctx.runtime_dir().join("wayvncctl"),
+            name: "agent-display",
+            view_only,
+            exit_on_disconnect,
+            listen: &["127.0.0.1".into(), port.to_string()],
+        })?;
+        let ready = || ctx.sys.listener_in_unit(ctx, port as u16, &unit_name(VNC_UNIT));
+        unlink_missing_ok(&view_exits_marker(ctx));
+        start_wayvnc(ctx, VNC_UNIT, &argv, None, "Agent display VNC viewer (loopback)", &ready)?;
         write_private(&port_file, &port.to_string())?;
+        if exit_on_disconnect {
+            write_private(&view_exits_marker(ctx), "")?;
+        }
     }
     ctx.println(&format!(
         "VNC on 127.0.0.1:{port} (loopback only). Will can run:\n  vncviewer 127.0.0.1::{port}\nStop with: agent-display unview"
     ));
+    // Say what the running viewer will actually do: a reused one keeps the
+    // options it was started with.
+    let exits = view_exits_marker(ctx).exists();
+    if exits {
+        ctx.println("It stops by itself when the last viewer disconnects.");
+    } else if reused && exit_on_disconnect {
+        ctx.println(
+            "The running viewer was started without --exit-on-disconnect and keeps its options: it stays up \
+             after viewers leave. Run `agent-display unview` first to restart it with --exit-on-disconnect.",
+        );
+    }
     Ok(0)
 }
 
@@ -590,6 +689,7 @@ pub fn cmd_unview(ctx: &Ctx) -> Result<i32> {
     let units = if ctx.sys.unit_active(ctx, VNC_UNIT) { vec![VNC_UNIT.to_string()] } else { vec![] };
     ctx.sys.stop_units(ctx, &units)?;
     unlink_missing_ok(&ctx.runtime_dir().join("vnc.port"));
+    unlink_missing_ok(&view_exits_marker(ctx));
     ctx.println("viewer stopped");
     Ok(0)
 }

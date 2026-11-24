@@ -3,6 +3,7 @@
 //! in README.md (Verification) and isolation_check.mjs.
 
 mod fakes;
+mod show_tests;
 mod tab_tests;
 
 use std::cell::RefCell;
@@ -489,7 +490,7 @@ fn unit_state_and_cgroup_come_from_one_systemctl_call() {
     let sys = Show(RefCell::new(vec![]));
     let ctx = Ctx::new(t.env(), &sys, Box::new(std::io::sink()), Box::new(std::io::sink()));
     let units = vec!["agent-display-browser".to_string(), "agent-display-browser-tmp-x".to_string()];
-    assert_eq!(systemd::units_active(&ctx, &units), vec![true, false]);
+    assert_eq!(systemd::units_active(&ctx, &units), vec![Some(true), Some(false)]);
     let calls = sys.0.borrow().clone();
     assert_eq!(calls.len(), 1);
     assert_eq!(&calls[0][..3], &["systemctl", "--user", "show"]);
@@ -519,6 +520,105 @@ fn browsers_registry_drops_inactive_units_in_one_query() {
     assert_eq!(got.iter().map(|b| b.unit()).collect::<Vec<_>>(), vec!["agent-display-browser"]);
     assert!(!dir.join("agent-display-browser-tmp-x.json").exists());
     assert!(dir.join("junk.json").exists());
+}
+
+fn write_registrations(ctx: &Ctx) -> PathBuf {
+    let dir = ctx.browsers_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("agent-display-browser.json"), r#"{"unit": "agent-display-browser", "port": 9425, "profile": "/p", "temp": false}"#).unwrap();
+    std::fs::write(dir.join("agent-display-browser-tmp-x.json"), r#"{"unit": "agent-display-browser-tmp-x", "port": 9555, "profile": "/q", "temp": true}"#).unwrap();
+    dir
+}
+
+#[test]
+fn systemctl_failure_never_unlinks_a_live_browser_registration() {
+    // systemctl timed out or failed: the units' states are unknown, which
+    // is not "stopped". Keep both registrations (the ownership check decides
+    // whether they're usable), and their remembered owners.
+    let t = TempHome::new();
+    let sys = FakeSys::default();
+    *sys.states_unknown.borrow_mut() = true;
+    let ctx = t.ctx(&sys);
+    let dir = write_registrations(&ctx);
+    std::fs::write(dir.join("agent-display-browser.owner"), "{}").unwrap();
+    let got = crate::browser::browsers_real(&ctx);
+    assert_eq!(got.iter().map(|b| b.unit()).collect::<Vec<_>>(), vec!["agent-display-browser-tmp-x", "agent-display-browser"]);
+    assert!(dir.join("agent-display-browser.json").exists());
+    assert!(dir.join("agent-display-browser-tmp-x.json").exists());
+    assert!(dir.join("agent-display-browser.owner").exists());
+    // Confirmed stopped: then (only then) forget it.
+    *sys.states_unknown.borrow_mut() = false;
+    let sys2 = FakeSys { active_fn: Some(Box::new(|u| !u.contains("tmp"))), ..Default::default() };
+    let ctx2 = t.ctx(&sys2);
+    std::fs::write(dir.join("agent-display-browser-tmp-x.owner"), "{}").unwrap();
+    let got = crate::browser::browsers_real(&ctx2);
+    assert_eq!(got.iter().map(|b| b.unit()).collect::<Vec<_>>(), vec!["agent-display-browser"]);
+    assert!(!dir.join("agent-display-browser-tmp-x.json").exists());
+    assert!(!dir.join("agent-display-browser-tmp-x.owner").exists());
+}
+
+#[test]
+fn unit_states_are_unknown_when_systemctl_fails_or_units_are_in_transition() {
+    struct Show(Option<&'static str>);
+    impl Sys for Show {
+        fn run(&self, _: &Ctx, _: &[String], _: Option<&Environ>, _: Option<f64>, _: bool) -> crate::util::Result<String> {
+            self.0.map(String::from).ok_or_else(|| crate::util::Error::new("systemctl: timed out"))
+        }
+    }
+    let t = TempHome::new();
+    let units = vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()];
+    let fail = Show(None);
+    let ctx = Ctx::new(t.env(), &fail, Box::new(std::io::sink()), Box::new(std::io::sink()));
+    assert_eq!(systemd::units_active(&ctx, &units), vec![None; 4]);
+    assert!(!systemd::unit_active(&ctx, "a"));
+    assert_eq!(systemd::unit_state(&ctx, "a"), None);
+    let mixed = Show(Some("Id=a.service\nActiveState=activating\n\nId=b.service\nActiveState=failed\n\nId=c.service\nActiveState=active"));
+    let ctx = Ctx::new(t.env(), &mixed, Box::new(std::io::sink()), Box::new(std::io::sink()));
+    // d is missing from the output: unknown, not inactive.
+    assert_eq!(systemd::units_active(&ctx, &units), vec![None, Some(false), Some(true), None]);
+}
+
+#[test]
+fn browsers_registry_needs_no_systemctl_for_a_confirmed_owner() {
+    let t = TempHome::new();
+    let asked = std::rc::Rc::new(RefCell::new(Vec::<String>::new()));
+    let a2 = asked.clone();
+    let sys = FakeSys {
+        active_fn: Some(Box::new(move |u| {
+            a2.borrow_mut().push(u.to_string());
+            true
+        })),
+        owner_ok: Some(Box::new(|o| o.port == 9425)),
+        ..Default::default()
+    };
+    let ctx = t.ctx(&sys);
+    let dir = write_registrations(&ctx);
+    std::fs::write(dir.join("agent-display-browser.owner"), r#"{"port": 9425, "pid": 4242, "start_time": 1, "inode": 7}"#).unwrap();
+    let got = crate::browser::browsers_real(&ctx);
+    // Same order as before: by registration file name.
+    assert_eq!(got.iter().map(|b| b.unit()).collect::<Vec<_>>(), vec!["agent-display-browser-tmp-x", "agent-display-browser"]);
+    // Only the browser without a confirmed owner went to systemctl.
+    assert_eq!(*asked.borrow(), vec!["agent-display-browser-tmp-x"]);
+}
+
+#[test]
+fn browser_stop_with_an_unknown_state_closes_it_and_forgets_it_only_when_gone() {
+    // systemctl can't read the browser unit: it may still run. Stop it
+    // (not skip it), and keep the registration if that fails, so tab
+    // commands don't call a running browser down (5).
+    let t = TempHome::new();
+    let sys = FakeSys::default();
+    *sys.states_unknown.borrow_mut() = true;
+    *sys.stop_fail.borrow_mut() = true;
+    let ctx = t.ctx(&sys);
+    let dir = write_registrations(&ctx);
+    let units = vec!["agent-display-browser".to_string()];
+    assert!(crate::browser::close_browsers(&ctx, &units).is_err());
+    assert!(dir.join("agent-display-browser.json").exists(), "kept while it may run");
+    *sys.stop_fail.borrow_mut() = false;
+    crate::browser::close_browsers(&ctx, &units).unwrap();
+    assert_eq!(*sys.stopped.borrow(), vec![units.clone()]);
+    assert!(!dir.join("agent-display-browser.json").exists());
 }
 
 // ------------------------------------------------------------ type

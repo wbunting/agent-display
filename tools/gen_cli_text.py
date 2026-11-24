@@ -1,5 +1,9 @@
 """Regenerate src/cli_text.rs from the Python reference's argparse parser.
 
+Historical: it produced the table at the port. The Rust tool is canonical
+now and has subcommands the Python lacks (`tab show`, `tab unshow`), so
+running this would drop them; edit src/cli_text.rs by hand instead.
+
 usage: COLUMNS=80 python3 -I tools/gen_cli_text.py PATH/TO/agent-display > src/cli_text.rs
 
 Usage and help texts are argparse's own output (80 columns, as when stdout

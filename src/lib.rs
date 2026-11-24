@@ -11,6 +11,7 @@ pub mod display;
 pub mod hold_input;
 pub mod json;
 pub mod net;
+pub mod show;
 pub mod sway;
 pub mod systemd;
 pub mod tab;
@@ -37,15 +38,17 @@ pub fn main_with(ctx: &Ctx, argv: &[String]) -> i32 {
         cmd,
         Cmd::TabOpen { .. } | Cmd::TabGoto { .. } | Cmd::TabEval { .. } | Cmd::TabShot { .. }
             | Cmd::TabInfo { .. } | Cmd::TabClose { .. } | Cmd::TabList { .. }
+            | Cmd::TabShow { .. } | Cmd::TabUnshow { .. }
     );
     match dispatch(ctx, &cmd) {
         Ok(code) => code,
         Err(e) => {
             // tab commands report socket errors as `CDP: ...` (the Python's
             // OSError handler); others print the message as is.
+            let code = e.code;
             let msg = if is_tab { tab::cdp_text(&e) } else { e.msg };
             ctx.eprintln(&format!("agent-display: {msg}"));
-            1
+            code
         }
     }
 }
@@ -80,7 +83,9 @@ fn dispatch(ctx: &Ctx, cmd: &Cmd) -> util::Result<i32> {
         TabInfo { o, tab } => tab::cmd_tab_info(ctx, o, tab),
         TabClose { o, tab } => tab::cmd_tab_close(ctx, o, tab),
         TabList { o } => tab::cmd_tab_list(ctx, o),
-        View { port, view_only } => display::cmd_view(ctx, *port, *view_only),
+        TabShow { o, tab, show } => show::cmd_tab_show(ctx, o, tab, show),
+        TabUnshow { tab } => show::cmd_tab_unshow(ctx, tab),
+        View { port, view_only, exit_on_disconnect } => display::cmd_view(ctx, *port, *view_only, *exit_on_disconnect),
         Unview => display::cmd_unview(ctx),
         HoldInput => display::cmd_hold_input(ctx),
     }

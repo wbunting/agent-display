@@ -16,14 +16,44 @@ use std::time::{Duration, Instant};
 pub struct Error {
     pub msg: String,
     pub os: bool,
+    /// Process exit status for this error (see `exit`).
+    pub code: i32,
+}
+
+/// Exit statuses shared by the `tab` commands. Agents branch on these, so
+/// they are a contract: never reuse a number for another meaning. Numbers
+/// reserved for commands that don't exist yet are not documented to users
+/// (README, `tab -h`) until those commands land.
+pub mod exit {
+    /// Any other failure (refusals, bad input, CDP errors).
+    pub const ERROR: i32 = 1;
+    /// Command line usage error (argparse).
+    pub const USAGE: i32 = 2;
+    /// A wait ran out of time (`tab show --timeout`).
+    pub const TIMEOUT: i32 = 3;
+    /// The tab is gone: closed or crashed, confirmed twice ~250 ms apart.
+    pub const GONE: i32 = 4;
+    /// The browser holding the tab is not running.
+    pub const BROWSER_DOWN: i32 = 5;
+    /// Reserved: read-back after an input action did not match. Not used
+    /// by any command yet.
+    pub const MISMATCH: i32 = 6;
+    /// No definitive answer (browser stalled, lookup failed after internal
+    /// retries): try again later. EX_TEMPFAIL.
+    pub const TEMPFAIL: i32 = 75;
 }
 
 impl Error {
     pub fn new(msg: impl Into<String>) -> Self {
-        Error { msg: msg.into(), os: false }
+        Error { msg: msg.into(), os: false, code: exit::ERROR }
     }
     pub fn os(msg: impl Into<String>) -> Self {
-        Error { msg: msg.into(), os: true }
+        Error { msg: msg.into(), os: true, code: exit::ERROR }
+    }
+    /// Same error with another exit status.
+    pub fn with_code(mut self, code: i32) -> Self {
+        self.code = code;
+        self
     }
     pub fn is_timeout(&self) -> bool {
         self.msg.contains("timed out")
@@ -313,6 +343,40 @@ pub fn hex(data: &[u8]) -> String {
 }
 
 // ------------------------------------------------------------ files
+
+/// Create directory `path` with mode 0700; an existing one is fine (its
+/// mode is not changed: callers that require 0700 check it).
+pub fn mkdir_private(path: &Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    match std::fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// An exclusive `flock` on `path` (created 0600 if missing), held until
+/// dropped. Blocks until it is free; retries on EINTR.
+pub struct FileLock {
+    _file: std::fs::File,
+}
+
+impl FileLock {
+    pub fn acquire(path: &Path) -> Result<FileLock> {
+        use std::os::fd::AsRawFd;
+        let f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600).open(path)?;
+        loop {
+            // SAFETY: flock on a fd we own.
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return Ok(FileLock { _file: f });
+            }
+            let e = io::Error::last_os_error();
+            if e.kind() != io::ErrorKind::Interrupted {
+                return Err(e.into());
+            }
+        }
+    }
+}
 
 /// Write a 0600 file (created or truncated), like the Python's write_private.
 pub fn write_private(path: &Path, text: &str) -> Result<()> {
