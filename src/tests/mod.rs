@@ -5,6 +5,7 @@
 mod fakes;
 mod show_tests;
 mod tab_tests;
+mod wait_tests;
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};

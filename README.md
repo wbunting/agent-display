@@ -68,7 +68,7 @@ sequence of blocking request/response steps with deadlines.
    are created lazily) and only when it repeats ~250 ms later.
 5. **Exit statuses** shared by all `tab` commands (`util::exit`, also in
    `agent-display tab -h`): 0 ok, 1 error, 2 usage, 3 timed out
-   (`tab show --timeout`), 4 tab gone (closed or crashed, checked twice),
+   (`tab show`/`tab wait --timeout`), 4 tab gone (closed or crashed, checked twice),
    5 browser down, 75 no definitive answer (stalled or restarting browser,
    after retries within 15 s): try again. A lookup never guesses "closed".
    With or without `--port`: an explicit port is only checked for
@@ -143,13 +143,21 @@ sequence of blocking request/response steps with deadlines.
    `view` gained `--exit-on-disconnect`; reusing a running `view` says
    whether that viewer stops by itself (it keeps the options it was
    started with).
+10. **JavaScript dialogs** don't wedge tabs: `goto`, `eval`, `shot` and `info`
+    enable Page events and answer any dialog that opens while they are
+    attached (noted on stderr; stdout unchanged): `alert`/`confirm`/`prompt`
+    are dismissed, `beforeunload` is accepted so the navigation that raised
+    it goes ahead. They make one round trip to the page before
+    detaching. Before, a dialog that opened during a command (for example an
+    inline `alert()` during `goto`) left the renderer blocked for every
+    later client. See [docs/tab-wait.md](docs/tab-wait.md#javascript-dialogs).
 
 Also: sway IPC over `SWAYSOCK` instead of `swaymsg` subprocesses (and a
 5 ms window poll in `tab open`/`close` instead of 20 ms); one `systemctl show`
 for all registered browser units instead of `systemctl is-active` per unit.
 
 `-h` and usage texts are in `src/cli_text.rs`, edited by hand now (the
-Python generator predates `tab show`); a test checks every parser has a
+Python generator predates `tab show` and `tab wait`); a test checks every parser has a
 matching entry.
 
 Known differences: `-h` and usage texts are always the 80-column argparse
@@ -158,12 +166,28 @@ texts that quote `swaymsg` or urllib internals read `sway IPC: ...` or
 `<urlopen error [Errno N] ...>`-style approximations; a JSON integer beyond
 64 bits from `tab eval` prints as a float.
 
+## `tab wait` (new in this port)
+
+`agent-display tab wait TAB --url RE | --url-not RE | --title RE | --text RE |
+--text-not RE | --selector CSS | --selector-not CSS | --js EXPR | --gone` blocks
+until the tab reaches that state. It is driven by page events, not polling,
+and rides out browser stalls, using the same lookup and exit statuses as the
+other `tab` commands: 0 on a match, 3 on timeout, 4 if the tab was closed or
+crashed, 5 if the browser went down, 75 if the deadline passed while the
+browser was stalled. `--follow` prints
+a JSON line per state change, for background monitors. Use it instead of
+polling `tab info`/`tab list` when waiting for a human (phone approvals, SMS
+codes, email links). See [docs/tab-wait.md](docs/tab-wait.md).
+
 ## Verification (omarchy, sway 1.12, Chromium on the shared display)
 
 - `cargo test`: the Python's 87 cases, with every `tab` case run with and
   without the sway fake like the Python's subclass; plus parser, JSON, IPC,
-  WebSocket, wire-format, /proc ownership and retry tests, and the lookup,
-  exit-status, owner-cache, gc-guard and `tab show` tests (176 in all).
+  WebSocket, wire-format, /proc ownership and retry tests, the lookup,
+  exit-status, owner-cache, gc-guard and `tab show` tests, `tab wait`
+  against a scripted page with fake time and its in-page checker in node
+  (skipped without node), and dialog handling on a socket pair and in
+  `goto`/`eval`/`shot`/`info`.
 - `cargo clippy --all-targets --features bench-trace -- -D warnings`: clean.
 - Live: `status`, `start` (already running), persistent `browser start`
   (`already_running`), `browser start --temp` / `browser stop UNIT`

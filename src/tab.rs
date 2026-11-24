@@ -111,7 +111,7 @@ pub fn check_owned(ctx: &Ctx, port: i64, unit: &str) -> Result<u16> {
 /// `answering`: also require a CDP answer (`check_owned`, 75 on a stall);
 /// otherwise only ownership (`check_listener`), for callers that ride out
 /// stalls themselves.
-fn explicit_port(ctx: &Ctx, port: i64, answering: bool) -> Result<u16> {
+pub(crate) fn explicit_port(ctx: &Ctx, port: i64, answering: bool) -> Result<u16> {
     let unit = owned_ports(ctx).into_iter().find(|(p, _)| *p == port).map(|(_, u)| u);
     match unit {
         Some(u) if reserved_reason(port).is_none() => {
@@ -243,16 +243,22 @@ fn scan(ctx: &Ctx, tab: &str, port: Option<i64>, step: f64) -> Scan {
 /// None no definitive answer (a browser didn't answer). One scan per pass,
 /// `step` per CDP step; no retries beyond the recheck.
 pub fn locate(ctx: &Ctx, tab: &str, port: Option<i64>, step: f64) -> Option<Option<Found>> {
+    locate_why(ctx, tab, port, step).ok()
+}
+
+/// `locate`, saying why there is no definitive answer (`tab wait` reports
+/// it in its `stall` events).
+pub fn locate_why(ctx: &Ctx, tab: &str, port: Option<i64>, step: f64) -> std::result::Result<Option<Found>, String> {
     for pass in 0..2 {
         match scan(ctx, tab, port, step) {
-            Scan::Found(f) => return Some(Some(f)),
-            Scan::NoBrowser => return Some(None),
-            Scan::Unavailable(_) => return None,
+            Scan::Found(f) => return Ok(Some(f)),
+            Scan::NoBrowser => return Ok(None),
+            Scan::Unavailable(problems) => return Err(problems.join(", ")),
             Scan::Missing if pass == 0 => ctx.sys.sleep(GONE_RECHECK),
             Scan::Missing => {}
         }
     }
-    Some(None)
+    Ok(None)
 }
 
 /// Find TAB in the agent-display browsers (or the one on `port`). Errors
@@ -345,7 +351,53 @@ fn or_default(t: Option<f64>, default: f64) -> f64 {
     }
 }
 
+/// Seconds the detach barrier (see `detach_answering_dialogs`) waits for
+/// the page.
+pub const DIALOG_BARRIER: f64 = 1.0;
+/// `Target.detachFromTarget` timeout when a tab session ends.
+pub const DETACH_TIMEOUT: f64 = 5.0;
+
+/// End a tab session without losing a JavaScript dialog: one round trip to
+/// the page first (the barrier), then detach. A dialog opened by what just
+/// ran (a load handler, a short setTimeout) blocks the renderer, so its
+/// event arrives before the barrier's reply and the connection answers it
+/// (see `cdp::Dialog`) before we detach. One that opens between that reply
+/// and the detach (a ~1 ms window) is Chromium's to handle afterwards (see
+/// docs/tab-wait.md, "JavaScript dialogs"). Both steps together take at
+/// most `limit` s (normally DIALOG_BARRIER + 5 s). Best effort: errors are
+/// ignored, the session is going away anyway.
+pub fn detach_answering_dialogs(ctx: &Ctx, cdp: &mut dyn CdpConn, session: &str, limit: f64) {
+    let start = ctx.sys.now();
+    let left = |ctx: &Ctx| (limit - ctx.sys.now().saturating_duration_since(start).as_secs_f64()).max(0.001);
+    let _ = cdp.call("Runtime.evaluate", json!({"expression": "0"}), Some(session), Some(DIALOG_BARRIER.min(left(ctx))));
+    let _ = cdp.call("Target.detachFromTarget", json!({"sessionId": session}), None, Some(DETACH_TIMEOUT.min(left(ctx))));
+}
+
+/// stderr note for each JavaScript dialog a command answered (kind only:
+/// the message is page text).
+pub fn report_dialogs(ctx: &Ctx, tab: &str, dialogs: &[crate::cdp::Dialog]) {
+    for d in dialogs {
+        let verb = if d.accepted { "accepted" } else { "dismissed" };
+        ctx.eprintln(&format!("agent-display: {verb} a JavaScript {} dialog in tab {tab}", d.kind));
+    }
+}
+
+/// Message of a CDP `exceptionDetails`: the exception's description, else
+/// the text, else "exception". Used by `eval` and `tab wait`.
+pub fn exception_text(d: &Value) -> String {
+    let desc = d.get("exception").and_then(|e| e.get("description")).filter(|v| truthy(v));
+    match desc.or_else(|| d.get("text").filter(|v| truthy(v))) {
+        Some(Value::String(s)) => s.clone(),
+        Some(v) => v.to_string(),
+        None => "exception".into(),
+    }
+}
+
 /// Flat CDP session on one tab; detaches (never closes) on drop.
+///
+/// JavaScript dialogs that open while it is attached are dismissed as they
+/// open (see `cdp::Dialog` for why they must be answered) and noted on
+/// stderr, so a page's alert()/confirm() can't wedge the tab.
 pub struct Tab<'a, 'c> {
     ctx: &'a Ctx<'c>,
     pub port: u16,
@@ -370,7 +422,11 @@ impl<'a, 'c> Tab<'a, 'c> {
             cdp.close();
             bail!("Target.attachToTarget: no sessionId");
         };
-        Ok(Tab { ctx, port, tab: tab.to_string(), timeout, cdp, session })
+        cdp.set_dialog_policy(false);
+        let mut t = Tab { ctx, port, tab: tab.to_string(), timeout, cdp, session };
+        // Page events report dialogs (and the load event `goto` waits for).
+        t.call("Page.enable", json!({}), None)?;
+        Ok(t)
     }
 
     pub fn call(&mut self, method: &str, params: Value, timeout: Option<f64>) -> Result<Value> {
@@ -388,14 +444,7 @@ impl<'a, 'c> Tab<'a, 'c> {
             timeout,
         )?;
         if let Some(d) = res.get("exceptionDetails") {
-            let desc = d.get("exception").and_then(|e| e.get("description")).filter(|v| truthy(v));
-            let text = desc.or_else(|| d.get("text").filter(|v| truthy(v)));
-            let text = match text {
-                Some(Value::String(s)) => s.clone(),
-                Some(v) => v.to_string(),
-                None => "exception".into(),
-            };
-            bail!("eval threw: {text}");
+            bail!("eval threw: {}", exception_text(d));
         }
         let r = res.get("result").cloned().unwrap_or_else(|| json!({}));
         if let Some(v) = r.get("value") {
@@ -417,9 +466,6 @@ impl<'a, 'c> Tab<'a, 'c> {
 
     pub fn goto(&mut self, url: &str, wait_ms: Option<i64>, wait_load: bool, timeout: Option<f64>) -> Result<Value> {
         let timeout = or_default(timeout, self.timeout);
-        if wait_load {
-            self.call("Page.enable", json!({}), None)?;
-        }
         let res = self.call("Page.navigate", json!({"url": url}), Some(timeout))?;
         if let Some(err) = res.get("errorText").filter(|v| truthy(v)) {
             bail!("navigate {url}: {}", err.as_str().map(String::from).unwrap_or_else(|| err.to_string()));
@@ -491,7 +537,8 @@ impl<'a, 'c> Tab<'a, 'c> {
 
 impl Drop for Tab<'_, '_> {
     fn drop(&mut self) {
-        let _ = self.cdp.call("Target.detachFromTarget", json!({"sessionId": self.session}), None, Some(5.0));
+        detach_answering_dialogs(self.ctx, self.cdp.as_mut(), &self.session, DIALOG_BARRIER + DETACH_TIMEOUT);
+        report_dialogs(self.ctx, &self.tab, &self.cdp.take_dialogs());
         self.cdp.close();
     }
 }

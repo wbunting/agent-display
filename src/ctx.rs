@@ -224,6 +224,10 @@ pub trait Sys {
     fn sleep(&self, secs: f64) {
         std::thread::sleep(std::time::Duration::from_secs_f64(secs.max(0.0)));
     }
+    /// Monotonic clock for long waits (`tab wait`), so tests can fake time.
+    fn now(&self) -> std::time::Instant {
+        std::time::Instant::now()
+    }
     fn mkdtemp(&self, prefix: &str, dir: &Path) -> Result<PathBuf> {
         net::mkdtemp(prefix, dir)
     }

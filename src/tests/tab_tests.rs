@@ -88,6 +88,16 @@ impl Fx {
     }
 }
 
+/// The last page command before the detach barrier (`Runtime.evaluate 0`)
+/// and the detach that end every Tab session.
+fn assert_tail(f: &Fx, last: &str) {
+    let c = f.calls();
+    let n = c.len();
+    assert_eq!(c[n - 1].0, "Target.detachFromTarget");
+    assert_eq!((c[n - 2].0.as_str(), &c[n - 2].1["expression"]), ("Runtime.evaluate", &json!("0")));
+    assert_eq!(c[n - 3].0, last);
+}
+
 fn pos(v: &[String], m: &str) -> usize {
     v.iter().position(|x| x == m).unwrap_or_else(|| panic!("{m} not in {v:?}"))
 }
@@ -196,8 +206,7 @@ both!(shot_retries_hung_capture_with_resize, |f: Fx| {
         .map(|c| c.1["height"].as_i64().unwrap())
         .collect();
     assert_eq!(heights, vec![599, 600, 599, 600]);
-    let m = f.methods();
-    assert_eq!(m[m.len() - 2], "Emulation.clearDeviceMetricsOverride");
+    assert_tail(&f, "Emulation.clearDeviceMetricsOverride");
 });
 
 both!(shot_first_attempt_is_short_and_scales_for_full_page, |f: Fx| {
@@ -220,8 +229,7 @@ both!(shot_failure_leaves_no_file, |f: Fx| {
     let shot = f.t.root.join("shot.png");
     let (code, out, _) = f.cli(&["shot", "OTHERTAB00000001", shot.to_str().unwrap()]);
     assert_eq!((code, out.as_str()), (1, ""));
-    let m = f.methods();
-    assert_eq!(m[m.len() - 2], "Emulation.clearDeviceMetricsOverride");
+    assert_tail(&f, "Emulation.clearDeviceMetricsOverride");
     let left: Vec<_> = std::fs::read_dir(&f.t.root).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().contains("shot")).collect();
     assert!(left.is_empty());
 });
@@ -1003,4 +1011,79 @@ fn close_stall_with_the_browser_confirmed_stopped_is_still_5() {
     let (code, _, _) = f.cli(&["close", &tab]);
     assert_eq!(code, 5);
     assert_eq!(close_calls(&f), 1);
+}
+
+// ------------------------------------------------------------ dialogs
+
+/// A dialog the connection answered during `method` (see cdp::Dialog).
+fn dialog_on(f: &Fx, method: &'static str, kind: &'static str) {
+    let b = f.b.clone();
+    f.b.set_hook(move |m, p| {
+        // Not the detach barrier (`Runtime.evaluate 0`).
+        if m == method && p["expression"] != "0" {
+            let policy = b.st().dialog_policy.expect("dialog policy set before any page command");
+            let accepted = crate::cdp::answer_for(kind, policy);
+            b.st().dialogs.push(crate::cdp::Dialog { kind: kind.into(), accepted });
+        }
+        Hook::Pass
+    });
+}
+
+both!(page_commands_enable_page_and_dismiss_dialogs, |f: Fx| {
+    let shot = f.t.root.join("d.png");
+    let cases: Vec<(Vec<&str>, &str, &str)> = vec![
+        (vec!["goto", "OTHERTAB00000001", "https://b/"], "Page.navigate", "alert"),
+        (vec!["eval", "OTHERTAB00000001", "confirm('x')"], "Runtime.evaluate", "confirm"),
+        (vec!["shot", "OTHERTAB00000001", shot.to_str().unwrap()], "Page.captureScreenshot", "beforeunload"),
+        (vec!["info", "OTHERTAB00000001"], "Runtime.evaluate", "prompt"),
+    ];
+    for (argv, method, kind) in cases {
+        f.b.st().calls.clear();
+        dialog_on(&f, method, kind);
+        let (code, out, err) = f.cli(&argv);
+        assert_eq!(code, 0, "{argv:?}: {err}");
+        assert!(!out.contains("dismissed"), "stdout keeps its shape: {out}");
+        // beforeunload is accepted (leaving was asked for); the rest dismissed.
+        let verb = if kind == "beforeunload" { "accepted" } else { "dismissed" };
+        assert_eq!(err, format!("agent-display: {verb} a JavaScript {kind} dialog in tab OTHERTAB00000001\n"));
+        assert_eq!(f.b.st().dialog_policy, Some(false));
+        // Page.enable (dialog events) first, once; barrier, then detach.
+        let m = f.methods();
+        assert_eq!(m.iter().filter(|x| *x == "Page.enable").count(), 1, "{m:?}");
+        assert_eq!(pos(&m, "Page.enable"), pos(&m, "Target.attachToTarget") + 1);
+        assert_tail(&f, if method == "Page.captureScreenshot" { "Emulation.clearDeviceMetricsOverride" } else { "Runtime.evaluate" });
+    }
+});
+
+both!(no_dialog_no_note, |f: Fx| {
+    let (code, _, err) = f.cli(&["eval", "OTHERTAB00000001", "1"]);
+    assert_eq!((code, err.as_str()), (0, ""));
+});
+
+both!(dialog_reported_even_when_the_command_fails, |f: Fx| {
+    let b = f.b.clone();
+    f.b.set_hook(move |m, p| {
+        if m == "Runtime.evaluate" && p["expression"] != "0" {
+            b.st().dialogs.push(crate::cdp::Dialog { kind: "alert".into(), accepted: false });
+            return Hook::Return(Ok(json!({"exceptionDetails": {"text": "Uncaught", "exception": {"description": "Error: boom"}}})));
+        }
+        Hook::Pass
+    });
+    let (code, _, err) = f.cli(&["eval", "OTHERTAB00000001", "alert(1); throw new Error('boom')"]);
+    assert_eq!(code, 1);
+    assert_eq!(
+        err,
+        "agent-display: dismissed a JavaScript alert dialog in tab OTHERTAB00000001\nagent-display: eval threw: Error: boom\n"
+    );
+});
+
+#[test]
+fn exception_text_prefers_description_then_text() {
+    use crate::tab::exception_text;
+    let d = |v: Value| exception_text(&v);
+    assert_eq!(d(json!({"text": "Uncaught", "exception": {"description": "Error: boom\n    at x"}})), "Error: boom\n    at x");
+    // An empty description falls through to the text, then to "exception".
+    assert_eq!(d(json!({"text": "Uncaught", "exception": {"description": ""}})), "Uncaught");
+    assert_eq!(d(json!({"text": "", "exception": {}})), "exception");
+    assert_eq!(d(json!({"text": 7})), "7");
 }

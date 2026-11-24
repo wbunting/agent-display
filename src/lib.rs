@@ -17,6 +17,7 @@ pub mod systemd;
 pub mod tab;
 pub mod typing;
 pub mod util;
+pub mod wait;
 
 #[cfg(test)]
 mod tests;
@@ -38,7 +39,7 @@ pub fn main_with(ctx: &Ctx, argv: &[String]) -> i32 {
         cmd,
         Cmd::TabOpen { .. } | Cmd::TabGoto { .. } | Cmd::TabEval { .. } | Cmd::TabShot { .. }
             | Cmd::TabInfo { .. } | Cmd::TabClose { .. } | Cmd::TabList { .. }
-            | Cmd::TabShow { .. } | Cmd::TabUnshow { .. }
+            | Cmd::TabShow { .. } | Cmd::TabUnshow { .. } | Cmd::TabWait { .. }
     );
     match dispatch(ctx, &cmd) {
         Ok(code) => code,
@@ -85,6 +86,7 @@ fn dispatch(ctx: &Ctx, cmd: &Cmd) -> util::Result<i32> {
         TabList { o } => tab::cmd_tab_list(ctx, o),
         TabShow { o, tab, show } => show::cmd_tab_show(ctx, o, tab, show),
         TabUnshow { tab } => show::cmd_tab_unshow(ctx, tab),
+        TabWait { o, tab, spec } => wait::cmd_tab_wait(ctx, o, tab, spec),
         View { port, view_only, exit_on_disconnect } => display::cmd_view(ctx, *port, *view_only, *exit_on_disconnect),
         Unview => display::cmd_unview(ctx),
         HoldInput => display::cmd_hold_input(ctx),

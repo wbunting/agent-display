@@ -273,6 +273,20 @@ fn build() -> Parser {
     tsw.pos("tab", Nargs::One, Ty::Str, Val::None);
     let mut tus = tb.child("unshow");
     tus.pos("tab", Nargs::One, Ty::Str, Val::None);
+    // wait: --timeout bounds the whole wait (see wait.rs).
+    let mut tw = tab_cmd(&tb, "wait", true);
+    for (s, d) in [
+        ("--url", "url"), ("--url-not", "url_not"), ("--title", "title"), ("--text", "text"), ("--text-not", "text_not"),
+        ("--selector", "selector"), ("--selector-not", "selector_not"), ("--js", "js"),
+    ] {
+        tw.opt(s, d, Ty::Str, Val::None);
+    }
+    tw.flag("--gone", "gone");
+    tw.flag("--any", "any");
+    tw.flag("--follow", "follow");
+    tw.opt("--stable-ms", "stable_ms", Ty::Int, Val::Int(0));
+    tw.opt("--tick-ms", "tick_ms", Ty::Int, Val::Int(1000));
+    tw.opt("--dialog", "dialog", Ty::Str, Val::Str("dismiss".into())).choices = choices(&["accept", "dismiss"]);
     tb.sub(
         "tab_command",
         vec![
@@ -285,6 +299,7 @@ fn build() -> Parser {
             ("list", tl),
             ("show", tsw),
             ("unshow", tus),
+            ("wait", tw),
         ],
     );
     subs.push(("tab", tb));
@@ -770,6 +785,42 @@ pub struct ShowOpts {
     pub timeout: f64,
 }
 
+/// `tab wait` conditions (regexes are JavaScript, `RE` or `/RE/flags`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct WaitSpec {
+    pub url: Option<String>,
+    pub url_not: Option<String>,
+    pub title: Option<String>,
+    pub text: Option<String>,
+    pub text_not: Option<String>,
+    pub selector: Option<String>,
+    pub selector_not: Option<String>,
+    pub js: Option<String>,
+    pub gone: bool,
+    pub any: bool,
+    pub follow: bool,
+    pub stable_ms: i64,
+    pub tick_ms: i64,
+    pub dialog_accept: bool,
+    pub port: Option<i64>,
+}
+
+impl WaitSpec {
+    pub fn has_condition(&self) -> bool {
+        self.gone || self.has_page_condition()
+    }
+    pub fn has_page_condition(&self) -> bool {
+        self.page_spec().as_object().is_some_and(|m| m.values().any(|v| !v.is_null()))
+    }
+    /// The conditions evaluated in the page, as the check function's `S`.
+    pub fn page_spec(&self) -> serde_json::Value {
+        serde_json::json!({
+            "url": self.url, "url_not": self.url_not, "title": self.title, "text": self.text,
+            "text_not": self.text_not, "selector": self.selector, "selector_not": self.selector_not, "js": self.js,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Cmd {
     Check,
@@ -799,6 +850,7 @@ pub enum Cmd {
     TabList { o: TabOpts },
     TabShow { o: TabOpts, tab: String, show: ShowOpts },
     TabUnshow { tab: String },
+    TabWait { o: TabOpts, tab: String, spec: WaitSpec },
     View { port: i64, view_only: bool, exit_on_disconnect: bool },
     Unview,
     HoldInput,
@@ -832,6 +884,35 @@ fn list(ns: &Ns, k: &str) -> Vec<String> {
     }
 }
 
+/// The subparser at `path` under `p` (e.g. ["tab", "wait"]).
+fn sub_parser<'a>(p: &'a Parser, path: &[&str]) -> &'a Parser {
+    path.iter().fold(p, |p, name| &p.subs.iter().find(|(n, _)| n == name).expect("known subcommand").1)
+}
+
+/// Option combinations argparse can't express, reported like its errors
+/// (usage, exit 2), so a bad invocation never looks like a page-side error.
+fn check_wait(p: &Parser, o: &TabOpts, spec: &WaitSpec) -> Result<(), Exit> {
+    let fail = |msg: &str| Err(error(p, msg).0);
+    if !spec.has_condition() {
+        return fail(
+            "give a condition: --url, --url-not, --title, --text, --text-not, --selector, --selector-not, --js or --gone",
+        );
+    }
+    if spec.gone && spec.has_page_condition() && !spec.any {
+        return fail("argument --gone: with page conditions, also pass --any (a closed tab has no page)");
+    }
+    if o.timeout.is_nan() || o.timeout < 0.0 {
+        return fail("argument --timeout: must be >= 0 (0: no limit)");
+    }
+    if spec.stable_ms < 0 {
+        return fail("argument --stable-ms: must be >= 0");
+    }
+    if spec.tick_ms <= 0 {
+        return fail("argument --tick-ms: must be > 0");
+    }
+    Ok(())
+}
+
 /// Parse argv (without the program name) like `parser().parse_args(argv)`.
 pub fn parse(argv: &[String]) -> Result<Cmd, Exit> {
     let top = build();
@@ -850,7 +931,7 @@ pub fn parse(argv: &[String]) -> Result<Cmd, Exit> {
             },
         }
     };
-    Ok(match s(&ns, "command").as_str() {
+    let cmd = match s(&ns, "command").as_str() {
         "check" => Cmd::Check,
         "start" => Cmd::Start { size: s(&ns, "size"), renderer: os_(&ns, "renderer") },
         "stop" => Cmd::Stop,
@@ -909,6 +990,27 @@ pub fn parse(argv: &[String]) -> Result<Cmd, Exit> {
                     },
                 },
                 "unshow" => Cmd::TabUnshow { tab: s(&ns, "tab") },
+                "wait" => Cmd::TabWait {
+                    o,
+                    tab: s(&ns, "tab"),
+                    spec: WaitSpec {
+                        url: os_(&ns, "url"),
+                        url_not: os_(&ns, "url_not"),
+                        title: os_(&ns, "title"),
+                        text: os_(&ns, "text"),
+                        text_not: os_(&ns, "text_not"),
+                        selector: os_(&ns, "selector"),
+                        selector_not: os_(&ns, "selector_not"),
+                        js: os_(&ns, "js"),
+                        gone: b(&ns, "gone"),
+                        any: b(&ns, "any"),
+                        follow: b(&ns, "follow"),
+                        stable_ms: i(&ns, "stable_ms").unwrap_or(0),
+                        tick_ms: i(&ns, "tick_ms").unwrap_or(1000),
+                        dialog_accept: s(&ns, "dialog") == "accept",
+                        port: None,
+                    },
+                },
                 _ => Cmd::TabList { o },
             }
         }
@@ -919,7 +1021,11 @@ pub fn parse(argv: &[String]) -> Result<Cmd, Exit> {
         },
         "unview" => Cmd::Unview,
         _ => Cmd::HoldInput,
-    })
+    };
+    if let Cmd::TabWait { o, spec, .. } = &cmd {
+        check_wait(sub_parser(&top, &["tab", "wait"]), o, spec)?;
+    }
+    Ok(cmd)
 }
 
 #[cfg(test)]
@@ -949,6 +1055,22 @@ mod tests {
                    Cmd::TabGoto { o: o(), tab: "T".into(), url: "U".into(), wait_ms: Some(5) });
         assert_eq!(p("tab|shot|--full|T|P").unwrap(),
                    Cmd::TabShot { o: o(), tab: "T".into(), path: "P".into(), full_page: true });
+        assert_eq!(
+            p("tab|wait|T|--url-not|^https://x/login|--text|/approved/i|--any|--stable-ms|500|--timeout|0|--follow").unwrap(),
+            Cmd::TabWait {
+                o: TabOpts { timeout: 0.0, ..o() },
+                tab: "T".into(),
+                spec: WaitSpec {
+                    url_not: Some("^https://x/login".into()),
+                    text: Some("/approved/i".into()),
+                    any: true,
+                    follow: true,
+                    stable_ms: 500,
+                    tick_ms: 1000,
+                    ..WaitSpec::default()
+                },
+            }
+        );
         assert_eq!(p("tab|open|--t|3").unwrap(), Cmd::TabOpen { o: TabOpts { timeout: 3.0, ..o() }, url: None });
         assert_eq!(p("tab|open|--timeout=1_0").unwrap(), Cmd::TabOpen { o: TabOpts { timeout: 10.0, ..o() }, url: None });
         assert_eq!(p("click|--count|2|right").unwrap(), Cmd::Click { button: "right".into(), at: None, count: 2 });
@@ -1033,7 +1155,7 @@ mod tests {
             e.stdout
         };
         let tab = h("tab|-h");
-        assert!(tab.starts_with("usage: agent-display tab [-h]\n                         {open,goto,eval,shot,info,close,list,show,unshow} ...\n"));
+        assert!(tab.starts_with("usage: agent-display tab [-h]\n                         {open,goto,eval,shot,info,close,list,show,unshow,wait} ...\n"));
         assert!(tab.contains("    show                let a human see and use this tab's window over VNC\n"));
         assert!(tab.contains("  4   tab gone: closed or crashed (checked twice, ~250 ms apart)\n"));
         assert!(tab.contains("  75  no definitive answer (browser stalled or restarting): try again\n"));
@@ -1086,4 +1208,46 @@ mod tests {
         assert!(e.stdout.starts_with("usage: agent-display tab open [-h] [--port PORT] [--timeout TIMEOUT] [url]\n"));
         assert!(e.stdout.contains("seconds per CDP step (default 30)"));
     }
+
+    #[test]
+    fn tab_help_lists_wait_and_wait_help_is_complete() {
+        let e = p("tab|--help").unwrap_err();
+        assert_eq!((e.code, e.stderr.as_str()), (0, ""));
+        assert!(e.stdout.starts_with("usage: agent-display tab [-h]\n                         {open,goto,eval,shot,info,close,list,show,unshow,wait} ...\n"));
+        assert!(e.stdout.contains("\n    show                let a human see and use this tab's window over VNC\n"), "{}", e.stdout);
+        assert!(e.stdout.contains("\n    wait                wait until the tab reaches a state (URL, text, ...)\n"), "{}", e.stdout);
+        assert!(e.stdout.contains("\n  3   timed out (tab show/wait --timeout)\n"), "{}", e.stdout);
+
+        let e = p("tab|wait|--help").unwrap_err();
+        assert_eq!(e.code, 0);
+        let h = e.stdout;
+        assert!(h.starts_with("usage: agent-display tab wait [-h] [--port PORT] [--timeout TIMEOUT]\n"));
+        for want in [
+            "[--dialog {accept,dismiss}]", "--url RE ", "--url-not RE ", "--title RE ", "--text RE ", "--text-not RE ",
+            "--selector CSS ", "--selector-not CSS ", "--js EXPR ", "--gone ", "--any ", "--stable-ms N ", "--follow ",
+            "--tick-ms N ", "stalls included", "  0   matched", "  1   error", "  2   usage error", "  3   timeout",
+            "  4   the tab was closed or crashed", "  5   the browser went down", "  75  the deadline passed while the browser was stalled",
+        ] {
+            assert!(h.contains(want), "tab wait help lacks {want:?}:\n{h}");
+        }
+        // -h works after other arguments too, like argparse.
+        assert_eq!(p("tab|wait|T|--url|x|-h").unwrap_err().stdout, h);
+        // Usage errors print the wait usage.
+        let e = p("tab|wait").unwrap_err();
+        assert_eq!(e.code, 2);
+        assert!(e.stderr.starts_with("usage: agent-display tab wait [-h]"), "{}", e.stderr);
+        assert!(e.stderr.ends_with("agent-display tab wait: error: the following arguments are required: tab\n"), "{}", e.stderr);
+    }
+
+    #[test]
+    fn parses_tab_wait_dialog_and_defaults() {
+        let Cmd::TabWait { o, spec, .. } = p("tab|wait|T|--gone").unwrap() else { panic!() };
+        assert_eq!((o.timeout, spec.dialog_accept, spec.stable_ms, spec.tick_ms, spec.any, spec.follow), (30.0, false, 0, 1000, false, false));
+        let Cmd::TabWait { spec, .. } = p("tab|wait|T|--gone|--dialog|accept").unwrap() else { panic!() };
+        assert!(spec.dialog_accept);
+        // An expression starting with '-' needs the --js=EXPR form, as in argparse.
+        let Cmd::TabWait { spec, .. } = p("tab|wait|T|--js=-1 < 0").unwrap() else { panic!() };
+        assert_eq!(spec.js.as_deref(), Some("-1 < 0"));
+    }
+
 }
