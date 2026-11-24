@@ -129,9 +129,13 @@ check "3 s stall ridden out (exit 0 after $((SECONDS - s)) s)" test "$rc" -eq 0
 kill -STOP "$BPID"
 s=$SECONDS; run ad tab info "$VICTIM" 2> "$E2E_OUT/stall.err"; cat "$E2E_OUT/stall.err"
 el=$((SECONDS - s))
-kill -CONT "$BPID"; BPID=
 check "long stall: exit 75 after the ~15 s budget (${el} s)" test "$rc" -eq 75 -a "$el" -ge 12 -a "$el" -le 25
 check "long stall: never says closed" not grep -qi closed "$E2E_OUT/stall.err"
+s=$SECONDS; run ad tab info --port "$P" "$VICTIM" 2> "$E2E_OUT/stall-port.err"; cat "$E2E_OUT/stall-port.err"
+check "long stall with --port: exit 75, not a refusal ($((SECONDS - s)) s)" bash -c "test $rc -eq 75 && ! grep -q refusing '$E2E_OUT/stall-port.err'"
+s=$SECONDS; run ad tab open --port "$P" 2> "$E2E_OUT/stall-open.err"; cat "$E2E_OUT/stall-open.err"
+check "tab open on a stalled browser: exit 75 ($((SECONDS - s)) s)" test "$rc" -eq 75
+kill -CONT "$BPID"; BPID=
 run ad tab info "$VICTIM"
 check "after SIGCONT: found again" test "$rc" -eq 0
 
@@ -238,6 +242,34 @@ cat "$E2E_OUT/show2.jsonl"; echo "[exit $src]"
 check "until-url: exit 0, reason url-matched" bash -c "test $src -eq 0 && grep -q '\"reason\": \"url-matched\"' '$E2E_OUT/show2.jsonl'"
 check "until-url: viewer stopped (client cut off)" test "$(active_viewers)" -eq 0
 check "until-url: the URL (with its code) was never printed" not grep -q SECRET123 "$E2E_OUT/show2.jsonl"
+
+echo "-- show --until-url: the human leaves before the redirect (phone approval), it lands later"
+ad tab goto "$A" "http://127.0.0.1:$HP/handoff.html" >/dev/null
+ad tab show "$A" --until-url '/home\.html' --timeout 60 > "$E2E_OUT/show4.jsonl" &
+SP=$!
+for _ in $(seq 50); do [ -s "$E2E_OUT/show4.jsonl" ] && break; sleep 0.1; done
+SOCK=$(head -1 "$E2E_OUT/show4.jsonl" | jq -r .socket)
+timeout 30 python3 -I "$HERE/rfb.py" "unix:$SOCK" "$E2E_OUT/show4-frame.png" --hold 0.5 > /dev/null 2>&1
+sleep 2
+check "until-url: still waiting after the viewer left" kill -0 "$SP"
+ad tab eval "$A" 'location.href = "/home.html?code=SECRET456"' >/dev/null
+wait "$SP"; src=$?
+cat "$E2E_OUT/show4.jsonl"; echo "[exit $src]"
+check "until-url met after the viewer left: exit 0, url-matched" bash -c "test $src -eq 0 && grep -q '\"viewer\": \"stopped\"' '$E2E_OUT/show4.jsonl' && grep -q '\"reason\": \"url-matched\"' '$E2E_OUT/show4.jsonl'"
+check "until-url: the URL (with its code) was never printed" not grep -q SECRET456 "$E2E_OUT/show4.jsonl"
+
+echo "-- show --until-url: the human leaves and the URL never matches: exit 3"
+ad tab goto "$A" "http://127.0.0.1:$HP/handoff.html" >/dev/null
+s=$SECONDS
+ad tab show "$A" --until-url '/home\.html' --timeout 5 > "$E2E_OUT/show5.jsonl" &
+SP=$!
+for _ in $(seq 50); do [ -s "$E2E_OUT/show5.jsonl" ] && break; sleep 0.1; done
+SOCK=$(head -1 "$E2E_OUT/show5.jsonl" | jq -r .socket)
+timeout 30 python3 -I "$HERE/rfb.py" "unix:$SOCK" "$E2E_OUT/show5-frame.png" --hold 0.5 > /dev/null 2>&1
+wait "$SP"; src=$?
+cat "$E2E_OUT/show5.jsonl"; echo "[exit $src after $((SECONDS - s)) s]"
+check "until-url not met, viewer gone: exit 3, reason timeout (not disconnected/0)" bash -c "test $src -eq 3 && grep -q '\"reason\": \"timeout\"' '$E2E_OUT/show5.jsonl'"
+check "no viewer left" test "$(active_viewers)" -eq 0
 
 echo "-- show --timeout while a human is still connected: exit 3, viewer stopped"
 s=$SECONDS

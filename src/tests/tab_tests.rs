@@ -423,7 +423,7 @@ sway_only!(create_timeout_closes_late_tab_and_removes_output, |f: Fx| {
         Hook::Pass
     });
     let (code, out, err) = f.cli(&["open"]);
-    assert_eq!((code, out.as_str()), (1, ""));
+    assert_eq!((code, out.as_str()), (75, ""), "a stalled createTarget: try again");
     assert!(err.contains("timed out"), "{err}");
     assert_eq!(f.sw().st().outputs, vec!["HEADLESS-1"]);
     assert!(f.markers().is_empty());
@@ -856,4 +856,55 @@ sway_only!(close_unplugs_its_output_without_asking_again, |f: Fx| {
     // One lookup before the close; none for the gc of its own output.
     assert_eq!(count(&f, "Target.getTargetInfo"), 1);
     assert!(f.sys.sleeps.borrow().iter().all(|s| *s != 0.25));
+});
+
+// ------------------------------------------------------------ --port stalls
+// With an explicit --port a stall is still "try again" (75), never a
+// refusal (1); ownership refusals stay 1 and are never retried.
+
+both!(stall_with_explicit_port_is_tempfail_for_lookups, |mut f: Fx| {
+    let tab = f.open(&[])["tab"].as_str().unwrap().to_string();
+    stall_n(&mut f, usize::MAX);
+    f.sys.sleeps.borrow_mut().clear();
+    for argv in [
+        vec!["info", "--port", "9425", tab.as_str()],
+        vec!["eval", "--port", "9425", tab.as_str(), "1"],
+        vec!["close", "--port", "9425", tab.as_str()],
+    ] {
+        let (code, out, err) = f.cli(&argv);
+        assert_eq!((code, out.as_str()), (75, ""), "{argv:?}: {err}");
+        assert!(err.contains("no definitive answer"), "{err}");
+        assert!(!err.contains("refusing") && !err.contains("closed"), "{err}");
+    }
+    // Retried within the budget, like without --port.
+    assert_eq!(f.sys.sleeps.borrow()[..4], [0.5, 1.0, 2.0, 4.0]);
+    assert!(f.b.has(&tab));
+});
+
+both!(stall_with_explicit_port_that_clears_is_ridden_out, |mut f: Fx| {
+    stall_n(&mut f, 2);
+    let (code, out, err) = f.cli(&["info", "--port", "9425", "OTHERTAB00000001"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["tab"], "OTHERTAB00000001");
+});
+
+both!(stalled_browser_on_open_and_list_is_tempfail, |mut f: Fx| {
+    stall_n(&mut f, usize::MAX);
+    for argv in [&["open", "--port", "9425"][..], &["open"], &["list", "--port", "9425"], &["list"]] {
+        let (code, out, err) = f.cli(argv);
+        assert_eq!((code, out.as_str()), (75, ""), "{argv:?}: {err}");
+        assert!(err.contains("agent-display-browser is not answering CDP on 9425: CDP: timed out; try again"), "{err}");
+    }
+    assert!(!f.methods().contains(&"Target.createTarget".to_string()));
+});
+
+both!(explicit_port_refusal_is_still_1_and_not_retried, |f: Fx| {
+    *f.ready.borrow_mut() = Box::new(|_| false);
+    for argv in [&["info", "--port", "9425", "OTHERTAB00000001"][..], &["open", "--port", "9425"]] {
+        let (code, _, err) = f.cli(argv);
+        assert_eq!(code, 1, "{argv:?}: {err}");
+        assert!(err.contains("not served from agent-display-browser; refusing"), "{err}");
+    }
+    assert!(f.sys.sleeps.borrow().is_empty());
+    assert!(f.calls().is_empty());
 });

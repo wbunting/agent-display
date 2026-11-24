@@ -315,6 +315,13 @@ struct View<'a> {
 }
 
 /// Foreground part of `show`: print viewer events until the view ends.
+///
+/// With --until-url / --until-closed the condition decides: exit 0 only
+/// when it is met. The viewer may go first (the human disconnects, `tab
+/// unshow`); the tab is then still watched until the condition, --timeout
+/// (3) or the tab going away (4), because a sign-in often finishes after
+/// the human has left (phone approval, an emailed link). Only
+/// --wait-viewer alone ends with the viewer (0).
 fn follow(
     ctx: &Ctx,
     v: &View,
@@ -324,7 +331,10 @@ fn follow(
     cdp: &mut dyn crate::cdp::CdpConn,
 ) -> Result<i32> {
     let tab = v.tab;
+    let until = until_url.is_some() || s.until_closed;
     let mut seen_viewer = false;
+    // The viewer has exited; only the tab is watched (until mode).
+    let mut viewer_gone = false;
     let mut next_poll = Instant::now();
     let end = |reason: &str, code: i32| -> Result<i32> {
         if v.owned {
@@ -341,7 +351,7 @@ fn follow(
         if left <= 0.0 {
             return end("timeout", exit::TIMEOUT);
         }
-        if Instant::now() >= next_poll {
+        if viewer_gone || Instant::now() >= next_poll {
             next_poll = Instant::now() + Duration::from_secs_f64(TAB_POLL);
             match cdp.call("Target.getTargetInfo", json!({"targetId": tab}), None, Some(5.0)) {
                 Ok(r) => {
@@ -361,6 +371,10 @@ fn follow(
                 Err(_) => {}
             }
         }
+        if viewer_gone {
+            ctx.sys.sleep(left.min(TAB_POLL));
+            continue;
+        }
         match events.next(left.min(TAB_POLL)) {
             VncEvent::Idle => {}
             VncEvent::Closed => {
@@ -370,6 +384,13 @@ fn follow(
                     return end("timeout", exit::TIMEOUT);
                 }
                 if seen_viewer || !ctx.sys.unit_active(ctx, v.unit) {
+                    if until {
+                        // Nobody can see the tab any more, but the condition
+                        // can still be met: keep watching the tab.
+                        viewer_gone = true;
+                        emit(ctx, vec![("viewer", "stopped".into())]);
+                        continue;
+                    }
                     return end(if seen_viewer { "disconnected" } else { "stopped" }, 0);
                 }
                 // The event stream broke but wayvnc runs: keep the deadline.
@@ -384,7 +405,7 @@ fn follow(
                     }
                     Some("client-disconnected") => {
                         emit(ctx, vec![("viewer", "disconnected".into()), ("clients", clients.clone())]);
-                        if clients.as_i64() == Some(0) {
+                        if clients.as_i64() == Some(0) && !until {
                             return end("disconnected", 0);
                         }
                     }

@@ -332,3 +332,98 @@ fn show_errors_use_the_shared_exit_codes() {
     assert_eq!(code, 4, "{err}");
     assert!(viewer_runs(&f).is_empty());
 }
+
+// ------------------------------------------------------------ --until-*
+// Exit 0 only when the condition is met; a viewer leaving first doesn't end
+// the wait (the sign-in can finish on the human's phone).
+
+fn set_url(f: &Fx, tab: &str, url: &str) {
+    let mut st = f.b.st();
+    st.targets.iter_mut().find(|(k, _)| k == tab).unwrap().1["url"] = json!(url);
+}
+
+#[test]
+fn until_url_not_met_after_the_viewer_leaves_is_a_timeout_not_success() {
+    let mut f = fx();
+    f.sys.real_sleep_cap = Some(0.01);
+    let (tab, _) = opened(&f);
+    set_url(&f, &tab, "https://bank.example/login");
+    f.sys.vnc_script.borrow_mut().extend([ev("client-connected", 1), ev("client-disconnected", 0), VncEvent::Closed]);
+    // Above the 1 s grace: the viewer leaving now is not the timeout.
+    let (code, out, err) = f.cli(&["show", "--until-url", r"/home", "--timeout", "1.5", &tab]);
+    assert_eq!(code, 3, "{err}");
+    let l = lines(&out);
+    assert_eq!(&l[1..], &[
+        json!({"viewer": "connected", "clients": 1}),
+        json!({"viewer": "disconnected", "clients": 0}),
+        json!({"viewer": "stopped"}),
+        json!({"unshown": tab, "reason": "timeout"}),
+    ]);
+}
+
+#[test]
+fn until_url_met_after_the_viewer_left_is_success() {
+    // The human typed the SMS code and closed the viewer; the bank redirects
+    // once the phone approval lands.
+    let mut f = fx();
+    f.sys.real_sleep_cap = Some(0.01);
+    let (tab, _) = opened(&f);
+    set_url(&f, &tab, "https://bank.example/login");
+    let polls = std::rc::Rc::new(std::cell::Cell::new(0));
+    let p2 = polls.clone();
+    let t2 = tab.clone();
+    // The 5th getTargetInfo (well after the viewer left) sees the redirect.
+    f.b.set_hook(move |m, _| {
+        if m == "Target.getTargetInfo" {
+            p2.set(p2.get() + 1);
+            if p2.get() >= 5 {
+                return Hook::Return(Ok(json!({"targetInfo": {"targetId": t2, "type": "page",
+                    "url": "https://bank.example/home?code=SECRET", "title": ""}})));
+            }
+        }
+        Hook::Pass
+    });
+    f.sys.vnc_script.borrow_mut().extend([ev("client-connected", 1), ev("client-disconnected", 0), VncEvent::Closed]);
+    let (code, out, err) = f.cli(&["show", "--until-url", r"^https://bank\.example/home", "--timeout", "10", &tab]);
+    assert_eq!(code, 0, "{err}");
+    let l = lines(&out);
+    assert_eq!(l.last().unwrap(), &json!({"unshown": tab, "reason": "url-matched"}));
+    assert!(l.contains(&json!({"viewer": "stopped"})));
+    assert!(!out.contains("SECRET"));
+    assert!(polls.get() >= 5);
+}
+
+#[test]
+fn until_closed_waits_past_the_viewer_and_exits_0_when_the_tab_closes() {
+    let mut f = fx();
+    f.sys.real_sleep_cap = Some(0.01);
+    let (tab, _) = opened(&f);
+    // Found by the lookup and the first polls, then closed (every later
+    // getTargetInfo, including the double check, says no such target).
+    let mut n = 0;
+    f.b.set_hook(move |m, _| {
+        if m == "Target.getTargetInfo" {
+            n += 1;
+            if n > 4 {
+                return Hook::Return(Err(Error::new("Target.getTargetInfo: No target with given id found")));
+            }
+        }
+        Hook::Pass
+    });
+    f.sys.vnc_script.borrow_mut().extend([ev("client-connected", 1), ev("client-disconnected", 0), VncEvent::Closed]);
+    let (code, out, err) = f.cli(&["show", "--until-closed", "--timeout", "10", &tab]);
+    assert_eq!(code, 0, "{err}");
+    let l = lines(&out);
+    assert!(l.contains(&json!({"viewer": "stopped"})));
+    assert_eq!(l.last().unwrap(), &json!({"unshown": tab, "reason": "closed"}));
+}
+
+#[test]
+fn wait_viewer_alone_still_ends_on_disconnect() {
+    let f = fx();
+    let (tab, _) = opened(&f);
+    f.sys.vnc_script.borrow_mut().extend([ev("client-connected", 1), ev("client-disconnected", 0)]);
+    let (code, out, _) = f.cli(&["show", "--wait-viewer", &tab]);
+    assert_eq!(code, 0);
+    assert_eq!(lines(&out).last().unwrap(), &json!({"unshown": tab, "reason": "disconnected"}));
+}

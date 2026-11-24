@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
 
-use crate::browser::{OWNERSHIP_TIMEOUT, cdp_problem, listener_problem};
+use crate::browser::{OWNERSHIP_TIMEOUT, listener_problem};
 use crate::cdp::CdpConn;
 use crate::cli::TabOpts;
 use crate::ctx::*;
@@ -81,35 +81,57 @@ pub fn owned_ports(ctx: &Ctx) -> Vec<(i64, String)> {
     out
 }
 
-pub fn check_owned(ctx: &Ctx, port: i64, unit: &str) -> Result<u16> {
+/// The LISTEN socket on `port` belongs to `unit` (refusal, exit 1, if not).
+/// Says nothing about whether the browser answers.
+pub fn check_listener(ctx: &Ctx, port: i64, unit: &str) -> Result<u16> {
     if let Some(why) = reserved_reason(port) {
         bail!("port {port} is reserved ({why}); never drive it");
     }
     let Ok(p) = u16::try_from(port) else {
         bail!("CDP on port {port} is not served from {unit}; refusing");
     };
-    if let Some(problem) = cdp_problem(ctx, p, unit, OWNERSHIP_TIMEOUT) {
+    if let Some(problem) = listener_problem(ctx, p, unit) {
         bail!("{problem}; refusing");
     }
     Ok(p)
+}
+
+/// `check_listener`, then the browser must answer CDP. Not answering is a
+/// stall, not a refusal: exit 75 (try again).
+pub fn check_owned(ctx: &Ctx, port: i64, unit: &str) -> Result<u16> {
+    let p = check_listener(ctx, port, unit)?;
+    if let Err(e) = ctx.sys.cdp_version(p, OWNERSHIP_TIMEOUT) {
+        return Err(Error::new(format!("{unit} is not answering CDP on {p}: {}; try again", cdp_text(&e)))
+            .with_code(exit::TEMPFAIL));
+    }
+    Ok(p)
+}
+
+/// An explicit --port: refused (1) if it isn't a registered agent-display
+/// browser's, browser down (5) if nothing is registered or listening there.
+/// `answering`: also require a CDP answer (`check_owned`, 75 on a stall);
+/// otherwise only ownership (`check_listener`), for callers that ride out
+/// stalls themselves.
+fn explicit_port(ctx: &Ctx, port: i64, answering: bool) -> Result<u16> {
+    let unit = owned_ports(ctx).into_iter().find(|(p, _)| *p == port).map(|(_, u)| u);
+    match unit {
+        Some(u) if reserved_reason(port).is_none() => {
+            if answering { check_owned(ctx, port, &u) } else { check_listener(ctx, port, &u) }
+        }
+        // Nothing registered and nothing listening: that browser is gone
+        // (stopped or crashed), not someone else's port.
+        None if reserved_reason(port).is_none() && u16::try_from(port).is_ok_and(|p| p >= 1024 && ctx.sys.port_free(p)) => {
+            Err(browser_down(&format!("no agent-display browser on port {port} (stopped?)")))
+        }
+        _ => bail!("port {port} is not an agent-display browser (see `agent-display browser list`); refusing"),
+    }
 }
 
 /// Port to open or list tabs on: --port, else the persistent browser.
 pub fn tab_port(ctx: &Ctx, port: Option<i64>) -> Result<u16> {
     let owned = owned_ports(ctx);
     if let Some(port) = port {
-        let unit = owned.iter().find(|(p, _)| *p == port).map(|(_, u)| u.clone());
-        match unit {
-            Some(u) if reserved_reason(port).is_none() => return check_owned(ctx, port, &u),
-            // Nothing registered and nothing listening: that browser is gone
-            // (stopped or crashed), not someone else's port.
-            None if reserved_reason(port).is_none()
-                && u16::try_from(port).is_ok_and(|p| p >= 1024 && ctx.sys.port_free(p)) =>
-            {
-                return Err(browser_down(&format!("no agent-display browser on port {port} (stopped?)")));
-            }
-            _ => bail!("port {port} is not an agent-display browser (see `agent-display browser list`); refusing"),
-        }
+        return explicit_port(ctx, port, true);
     }
     if let Some((p, unit)) = owned.iter().find(|(_, u)| u == BROWSER_UNIT) {
         return check_owned(ctx, *p, unit);
@@ -241,8 +263,9 @@ pub fn lookup(ctx: &Ctx, tab: &str, port: Option<i64>) -> Result<Found> {
     }
     if let Some(p) = port {
         // Refusals (foreign, reserved, hijacked port) and a stopped browser
-        // are definitive: no retries.
-        tab_port(ctx, Some(p))?;
+        // are definitive: no retries. Whether it answers is left to the
+        // retry loop below, as without --port: a stall exits 75, not 1.
+        explicit_port(ctx, p, false)?;
     }
     let deadline = Instant::now() + Duration::from_secs_f64(LOOKUP_BUDGET);
     let mut tries = 0usize;
@@ -693,7 +716,7 @@ pub fn create_target(ctx: &Ctx, cdp: &mut dyn CdpConn, params: Value, nonce: &st
         }
         ctx.sys.sleep(0.2);
     }
-    Err(err)
+    Err(stalled(err))
 }
 
 /// New background window for a tab, alone on its own output if possible.
@@ -808,7 +831,7 @@ fn close_target(ctx: &Ctx, port: u16, tab: &str) -> Result<Value> {
 pub fn cmd_tab_open(ctx: &Ctx, o: &TabOpts, url: Option<&str>) -> Result<i32> {
     let port = tab_port(ctx, o.port_raw)?;
     let (tab, output) = {
-        let mut cdp = ctx.sys.cdp_connect(ctx, port, 10.0)?;
+        let mut cdp = ctx.sys.cdp_connect(ctx, port, 10.0).map_err(stalled)?;
         // Own window: Chromium doesn't paint background tabs, so a
         // screenshot of one hangs; activating it would take over another
         // agent's tab. See create_tab_window for the output.
@@ -879,6 +902,12 @@ fn retryable(e: &Error) -> bool {
     e.os || e.is_timeout() || e.msg.contains("is not answering CDP") || e.msg.contains("CDP closed")
 }
 
+/// A CDP step that timed out or lost its connection on an owned browser is
+/// a stall: exit 75 (try again), not 1.
+fn stalled(e: Error) -> Error {
+    if retryable(&e) { e.with_code(exit::TEMPFAIL) } else { e }
+}
+
 fn unit_for_port(ctx: &Ctx, port: u16) -> Option<String> {
     owned_ports(ctx).into_iter().find(|(p, _)| *p == port as i64).map(|(_, u)| u)
 }
@@ -931,7 +960,8 @@ pub fn cmd_tab_list(ctx: &Ctx, o: &TabOpts) -> Result<i32> {
     let port = tab_port(ctx, o.port_raw)?;
     let tabs: Vec<Value> = ctx
         .sys
-        .cdp_targets(port, TARGETS_TIMEOUT)?
+        .cdp_targets(port, TARGETS_TIMEOUT)
+        .map_err(stalled)?
         .into_iter()
         .filter(|t| t.get("type").and_then(Value::as_str) == Some("page"))
         .map(|t| {

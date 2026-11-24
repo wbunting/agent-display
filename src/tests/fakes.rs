@@ -144,6 +144,9 @@ pub struct FakeSys {
     /// Scripted wayvnc viewer events (then Closed); `vnc_events` calls.
     pub vnc_script: RefCell<VecDeque<VncEvent>>,
     pub vnc_opened: RefCell<Vec<PathBuf>>,
+    /// Really sleep min(secs, cap) too (loops paced by sleep against a
+    /// real deadline); default: sleeps are only recorded.
+    pub real_sleep_cap: Option<f64>,
     /// Unix sockets "wayvnc" made (systemd_run of a --unix-socket argv).
     pub sockets: RefCell<Vec<std::os::unix::net::UnixListener>>,
 }
@@ -274,6 +277,9 @@ impl Sys for FakeSys {
     }
     fn sleep(&self, secs: f64) {
         self.sleeps.borrow_mut().push(secs);
+        if let Some(cap) = self.real_sleep_cap {
+            std::thread::sleep(std::time::Duration::from_secs_f64(secs.clamp(0.0, cap)));
+        }
     }
     fn mkdtemp(&self, prefix: &str, dir: &Path) -> Result<PathBuf> {
         let p = crate::net::mkdtemp(prefix, self.mkdtemp_in.as_deref().unwrap_or(dir))?;

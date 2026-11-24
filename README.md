@@ -71,6 +71,10 @@ sequence of blocking request/response steps with deadlines.
    (`tab show --timeout`), 4 tab gone (closed or crashed, checked twice),
    5 browser down, 75 no definitive answer (stalled or restarting browser,
    after retries within 15 s): try again. A lookup never guesses "closed".
+   With or without `--port`: an explicit port is only checked for
+   ownership up front (a foreign or hijacked port is refused, 1); whether
+   it answers is ridden out like any lookup. `tab open`/`tab list` on a
+   stalled browser exit 75 too.
 6. **Unknown is not stopped**: `units_active` answers `Option<bool>`; a
    failed or timed-out `systemctl` (or a unit mid-transition) no longer
    deletes a running browser's registration.
@@ -95,6 +99,11 @@ sequence of blocking request/response steps with deadlines.
    `--wait-viewer`, `--until-url REGEX` and `--until-closed` keep it in the
    foreground, printing `{"viewer": "connected"}` / `"disconnected"` JSON
    lines and ending the view on the condition (the URL is never printed).
+   With `--until-*`, exit 0 means the condition was met: if the human
+   leaves first (`{"viewer": "stopped"}`), the tab is still watched until
+   the condition, `--timeout` (3) or the tab going away (4), since a
+   sign-in can finish on the human's phone after they close the viewer.
+   `--wait-viewer` alone ends (0) when the viewer disconnects.
    `tab close` and the output gc stop a tab's viewer. `view` gained
    `--exit-on-disconnect`.
 

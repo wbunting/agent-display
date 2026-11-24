@@ -116,6 +116,9 @@ Differences from the plan above:
   `systemctl` call for that browser.
 * `tab list` is unchanged (still `/json/list`, all tabs). Scoping it needs
   spaces (phase 1).
+* `tab show --until-url/--until-closed` exit 0 only when the condition is
+  met. A viewer that leaves first doesn't end the wait (phone approvals
+  finish after the human closes the viewer); `--timeout` gives 3.
 * `tab show` doesn't move seat focus: on the shared display that would
   steal focus from other agents' OS input. The human's first click in the
   viewer focuses the window, and popups then open on its output.
