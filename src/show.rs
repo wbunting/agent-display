@@ -98,22 +98,52 @@ fn state_token(ctx: &Ctx, output: &str) -> Option<String> {
     state_json(ctx, output)?.get("token")?.as_str().map(String::from)
 }
 
-/// Stop the viewer of `output`, if there is one. Cheap when there isn't:
-/// only asks systemd when a socket of it exists.
-pub fn stop_viewer(ctx: &Ctx, output: &str) -> bool {
+/// Which viewer `stop_viewer` may stop.
+#[derive(Clone, Copy)]
+pub enum Stop<'a> {
+    /// Whatever viewer runs on the output; skipped (no systemctl call) when
+    /// none of its files exist. For the output gc.
+    Any,
+    /// Same, but also asks systemd when the files are gone, so a viewer
+    /// whose files were lost is still found. For `tab unshow`.
+    Thorough,
+    /// Only the viewer whose state file holds this token (`show`'s own).
+    Token(&'a str),
+}
+
+/// Stop the viewer of `output` under its ViewerLock (so it can't interleave
+/// with a `show` starting one). Ok(true) if one was (or may have been)
+/// running and is now stopped.
+///
+/// An unknown unit state (systemctl failed or timed out) is not "stopped":
+/// the unit is stopped unless confirmed inactive, and the files are only
+/// removed once the stop succeeded or the unit is confirmed inactive. A
+/// failed stop keeps them (and is an Err, exit 75) so `tab unshow` can retry.
+pub fn stop_viewer(ctx: &Ctx, output: &str, which: Stop) -> Result<bool> {
     let files = [viewer_socket(ctx, output), viewer_control(ctx, output), viewer_state(ctx, output)];
-    if !files.iter().any(|f| f.exists()) {
-        return false;
+    if matches!(which, Stop::Any | Stop::Token(_)) && !files.iter().any(|f| f.exists()) {
+        return Ok(false);
+    }
+    let _lock = ViewerLock::acquire(ctx, output)?;
+    if let Stop::Token(t) = which
+        && state_token(ctx, output).as_deref() != Some(t)
+    {
+        return Ok(false); // not ours (any more)
     }
     let unit = viewer_unit(output);
-    let was = ctx.sys.unit_active(ctx, &unit);
-    if was {
-        let _ = ctx.sys.stop_units(ctx, &[unit]);
+    let state = crate::systemd::unit_state(ctx, &unit);
+    if state != Some(false) {
+        // Active, stopping, or unknown: stop it (a no-op if it isn't
+        // running). Keep its files if that fails.
+        if let Err(e) = ctx.sys.stop_units(ctx, std::slice::from_ref(&unit)) {
+            return Err(Error::new(format!("could not stop the viewer {unit}: {}; try again", e.msg))
+                .with_code(exit::TEMPFAIL));
+        }
     }
     for f in &files {
         unlink_missing_ok(f);
     }
-    was
+    Ok(state != Some(false))
 }
 
 // ------------------------------------------------------------ events
@@ -369,12 +399,14 @@ struct View<'a> {
 }
 
 impl View<'_> {
-    /// Stop our viewer, if it is still the one recorded for the output.
+    /// Stop our viewer, if it is still the one recorded for the output. A
+    /// failed stop is reported on stderr (the view's outcome is still
+    /// printed); its files stay, so `tab unshow` can retry.
     fn stop_own(&self, ctx: &Ctx) {
         if let Some(t) = self.token.as_deref()
-            && state_token(ctx, self.output).as_deref() == Some(t)
+            && let Err(e) = stop_viewer(ctx, self.output, Stop::Token(t))
         {
-            stop_viewer(ctx, self.output);
+            ctx.eprintln(&format!("agent-display: {}; stop it with `agent-display tab unshow {}`", e.msg, self.tab));
         }
     }
 }
@@ -484,7 +516,10 @@ pub fn cmd_tab_unshow(ctx: &Ctx, tab: &str) -> Result<i32> {
         bail!("invalid tab id {}", py_repr(tab));
     }
     let output = tab_output(ctx, tab);
-    let was = output.as_deref().is_some_and(|o| stop_viewer(ctx, o));
+    let was = match output.as_deref() {
+        Some(o) => stop_viewer(ctx, o, Stop::Thorough)?,
+        None => false,
+    };
     emit(ctx, vec![
         ("unshown", tab.into()),
         ("output", output.map(Value::from).unwrap_or(Value::Null)),

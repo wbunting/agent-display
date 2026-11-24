@@ -307,6 +307,39 @@ done
 check "re-show right after a disconnect keeps its state and token, can be reused and stopped (5/5: $ok)" test "$ok" -eq 5
 check "no viewer left after the re-show rounds" test "$(active_viewers)" -eq 0
 
+echo "-- systemctl can't tell a viewer's state (simulated): unshow still stops it"
+# A systemctl wrapper first on PATH: `show` of viewer units fails (as on a
+# timeout), and with FAIL_STOP=1 so does `stop`. Everything else is the real
+# systemctl, talking to the nested manager.
+mkdir -p "$E2E_ROOT/flaky"
+cat > "$E2E_ROOT/flaky/systemctl" <<'SH'
+#!/bin/sh
+case " $* " in
+  *" show "*agent-display-vnc-*) echo "Failed to get properties: Connection timed out" >&2; exit 1 ;;
+  *" stop "*agent-display-vnc-*) [ -n "$FAIL_STOP" ] && { echo "Failed to stop: Connection timed out" >&2; exit 1; } ;;
+esac
+exec /usr/bin/systemctl "$@"
+SH
+chmod +x "$E2E_ROOT/flaky/systemctl"
+ad_flaky() {
+    env -i HOME="$E2E_ROOT/home" USER="$USER" LOGNAME="$USER" LANG=C.UTF-8 FAIL_STOP="${FAIL_STOP:-}" \
+        PATH="$E2E_ROOT/flaky:/usr/local/bin:/usr/bin" XDG_RUNTIME_DIR="$E2E_ROOT/run" "$AD_BIN" "$@"
+}
+ad tab show "$A" >/dev/null
+FAIL_STOP=1 run ad_flaky tab unshow "$A"
+check "state unknown and stop failing: unshow exits 75" test "$rc" -eq 75
+check "the viewer's files are kept for a retry" test -S "$SOCK" -a -e "$E2E_ROOT/run/agent-display/vnc/$AO.json"
+check "the viewer still runs" test "$(active_viewers)" -eq 1
+run ad_flaky tab unshow "$A"
+check "state unknown, stop works: unshow stops it (was_shown true)" bash -c "test $rc -eq 0 && test $(active_viewers) -eq 0"
+check "and only then removes its files" test ! -e "$SOCK" -a ! -e "$E2E_ROOT/run/agent-display/vnc/$AO.json"
+
+echo "-- a running viewer whose files were lost: unshow finds it"
+ad tab show "$A" >/dev/null
+rm -f "$SOCK" "$E2E_ROOT/run/agent-display/vnc/$AO.json" "$E2E_ROOT/run/agent-display/vnc/$AO.ctl"
+run ad tab unshow "$A"
+check "lost files: unshow stopped the viewer (was_shown true)" bash -c "test $rc -eq 0 && test $(active_viewers) -eq 0"
+
 echo "-- two concurrent shows of one tab: one viewer, both see its options"
 ad tab show "$A" > "$E2E_OUT/c1.json" 2>&1 & C1=$!
 ad tab show "$A" > "$E2E_OUT/c2.json" 2>&1 & C2=$!

@@ -100,7 +100,12 @@ sequence of blocking request/response steps with deadlines.
    still holds the token it wrote). Re-showing right after a viewer exited
    waits out its still-stopping unit. Concurrent shows of one tab are
    serialised (`vnc/HEADLESS-N.lock`): one starts the viewer and writes its
-   state once wayvnc runs, the others reuse it. On someone else's viewer, `--wait-viewer` ends by its expiry
+   state once wayvnc runs, the others reuse it. Stopping a viewer (end of a
+   view, `tab unshow`, gc) happens under the same lock and treats an
+   unknown unit state as possibly running: it stops the unit and removes
+   the viewer's files only once that worked (a failed stop is 75 for
+   `unshow`, and the files stay for a retry). `unshow` also finds a running
+   viewer whose files were lost. On someone else's viewer, `--wait-viewer` ends by its expiry
    at the latest; `--until-*` wait their own `--timeout`.
    `--wait-viewer`, `--until-url REGEX` and `--until-closed` keep it in the
    foreground, printing `{"viewer": "connected"}` / `"disconnected"` JSON

@@ -610,7 +610,9 @@ fn gc_outputs(ctx: &Ctx, disp: &Disp, closed: Option<&str>) -> Result<Vec<String
     for (name, tab) in marked_outputs(ctx) {
         match counts.get(&name) {
             None => {
-                crate::show::stop_viewer(ctx, &name);
+                // Best effort: a viewer that can't be stopped now keeps its
+                // files and exits by its own timer.
+                let _ = crate::show::stop_viewer(ctx, &name, crate::show::Stop::Any);
                 unlink_missing_ok(&ctx.tab_outputs_dir().join(&name));
             }
             // "pending": its `tab open` died before creating the tab
@@ -637,7 +639,7 @@ fn gc_outputs(ctx: &Ctx, disp: &Disp, closed: Option<&str>) -> Result<Vec<String
     gone.extend(suspects.into_iter().map(|(name, _)| name));
     let mut removed = Vec::new();
     for name in gone {
-        crate::show::stop_viewer(ctx, &name);
+        let _ = crate::show::stop_viewer(ctx, &name, crate::show::Stop::Any);
         if ctx.sys.sway_cmd(disp, &format!("output {name} unplug")).is_err() {
             continue;
         }

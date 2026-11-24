@@ -515,7 +515,7 @@ fn reshow_waits_out_a_viewer_that_is_still_stopping() {
 }
 
 #[test]
-fn reshow_never_stops_a_viewer_another_call_just_started() {
+fn reshow_never_stops_a_viewer_that_is_already_running() {
     let mut f = fx();
     let (tab, _) = opened(&f);
     *f.sys.run_still_loaded.borrow_mut() = 1;
@@ -533,7 +533,7 @@ fn reshow_never_stops_a_viewer_another_call_just_started() {
     f.sys.active = None;
     let (code, _, err) = f.cli(&["show", &tab]);
     assert_eq!(code, 75, "{err}");
-    assert!(err.contains("was just started by another call; try again"), "{err}");
+    assert!(err.contains("is already running (started by another call, or a viewer whose files are gone); try again"), "{err}");
     assert!(stopped(&f).is_empty(), "{:?}", stopped(&f));
 }
 
@@ -670,4 +670,112 @@ fn starter_stops_its_viewer_after_a_reshow_during_the_old_units_stop() {
     // One stop to wait out the old unit, one by end() for our own viewer.
     assert_eq!(stopped(&f), vec!["agent-display-vnc-headless-2", "agent-display-vnc-headless-2"]);
     assert!(!f.t.rt.join("agent-display/vnc/HEADLESS-2.json").exists());
+}
+
+// ------------------------------------------------------------ round 5
+// An unknown unit state (systemctl failed/timed out) is not "stopped":
+// stop the unit anyway and keep its files unless that worked.
+
+/// [socket, state] of HEADLESS-2's viewer exist (the fake wayvnc makes no
+/// control socket).
+fn vnc_files(f: &Fx) -> Vec<bool> {
+    ["sock", "json"].iter().map(|e| f.t.rt.join(format!("agent-display/vnc/HEADLESS-2.{e}")).exists()).collect()
+}
+
+#[test]
+fn unshow_stops_a_viewer_whose_state_is_unknown() {
+    let f = fx();
+    let (tab, _) = opened(&f);
+    assert_eq!(f.cli(&["show", &tab]).0, 0);
+    *f.sys.unknown_prefix.borrow_mut() = Some("agent-display-vnc-".into());
+    let (code, out, err) = f.cli(&["unshow", &tab]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["was_shown"], true);
+    assert_eq!(stopped(&f), vec!["agent-display-vnc-headless-2"]);
+    assert_eq!(vnc_files(&f), vec![false; 2]);
+}
+
+#[test]
+fn failed_stop_keeps_the_files_and_unshow_can_retry() {
+    let f = fx();
+    let (tab, _) = opened(&f);
+    assert_eq!(f.cli(&["show", &tab]).0, 0);
+    *f.sys.unknown_prefix.borrow_mut() = Some("agent-display-vnc-".into());
+    *f.sys.stop_fail.borrow_mut() = true;
+    let (code, out, err) = f.cli(&["unshow", &tab]);
+    assert_eq!((code, out.as_str()), (75, ""), "{err}");
+    assert!(err.contains("could not stop the viewer agent-display-vnc-headless-2"), "{err}");
+    assert_eq!(vnc_files(&f), vec![true; 2], "kept for a retry");
+    *f.sys.stop_fail.borrow_mut() = false;
+    let (code, out, _) = f.cli(&["unshow", &tab]);
+    assert_eq!(code, 0);
+    assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["was_shown"], true);
+    assert_eq!(vnc_files(&f), vec![false; 2]);
+}
+
+#[test]
+fn foreground_show_stops_its_viewer_when_the_state_is_unknown() {
+    // systemctl can't answer for the viewer unit. The start still happens
+    // (unknown isn't "running"); the view's end must still stop it.
+    let f = fx();
+    let (tab, _) = opened(&f);
+    *f.sys.unknown_prefix.borrow_mut() = Some("agent-display-vnc-".into());
+    f.sys.vnc_script.borrow_mut().extend([ev("client-connected", 1)]);
+    let (code, out, err) = f.cli(&["show", "--wait-viewer", "--timeout", "0.05", &tab]);
+    assert_eq!(code, 3, "{err}");
+    assert_eq!(lines(&out).last().unwrap(), &json!({"unshown": tab, "reason": "timeout"}));
+    assert_eq!(stopped(&f), vec!["agent-display-vnc-headless-2"]);
+    assert_eq!(vnc_files(&f), vec![false; 2]);
+}
+
+#[test]
+fn foreground_show_reports_a_failed_stop_and_keeps_the_files() {
+    let f = fx();
+    let (tab, _) = opened(&f);
+    f.sys.vnc_script.borrow_mut().extend([ev("client-connected", 1)]);
+    *f.sys.unknown_prefix.borrow_mut() = Some("agent-display-vnc-".into());
+    *f.sys.stop_fail.borrow_mut() = true;
+    let (code, out, err) = f.cli(&["show", "--wait-viewer", "--timeout", "0.05", &tab]);
+    // The view's outcome is still its outcome; the failed stop is on stderr.
+    assert_eq!(code, 3, "{err}");
+    assert_eq!(lines(&out).last().unwrap(), &json!({"unshown": tab, "reason": "timeout"}));
+    assert!(err.contains("could not stop the viewer agent-display-vnc-headless-2"), "{err}");
+    assert!(err.contains(&format!("agent-display tab unshow {tab}")), "{err}");
+    assert_eq!(vnc_files(&f), vec![true; 2]);
+}
+
+#[test]
+fn unshow_finds_a_running_viewer_whose_files_are_gone() {
+    let f = fx();
+    let (tab, _) = opened(&f);
+    assert_eq!(f.cli(&["show", &tab]).0, 0);
+    for e in ["sock", "ctl", "json"] {
+        let _ = std::fs::remove_file(f.t.rt.join(format!("agent-display/vnc/HEADLESS-2.{e}")));
+    }
+    let (code, out, _) = f.cli(&["unshow", &tab]);
+    assert_eq!(code, 0);
+    assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["was_shown"], true);
+    assert_eq!(stopped(&f), vec!["agent-display-vnc-headless-2"]);
+    // Nothing running any more: a second unshow is a no-op.
+    let (_, out, _) = f.cli(&["unshow", &tab]);
+    assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["was_shown"], false);
+    assert_eq!(stopped(&f), vec!["agent-display-vnc-headless-2"]);
+}
+
+#[test]
+fn viewer_stops_happen_under_the_viewer_lock() {
+    let f = fx();
+    let (tab, _) = opened(&f);
+    assert_eq!(f.cli(&["show", &tab]).0, 0);
+    assert_eq!(f.cli(&["unshow", &tab]).0, 0);
+    assert_eq!(f.cli(&["show", &tab]).0, 0);
+    assert_eq!(f.cli(&["close", &tab]).0, 0); // gc stops it
+    f.sys.vnc_script.borrow_mut().extend([ev("client-connected", 1)]);
+    let (tab2, _) = {
+        let o = f.open(&[]);
+        (o["tab"].as_str().unwrap().to_string(), o["output"].as_str().unwrap().to_string())
+    };
+    let _ = f.cli(&["show", "--wait-viewer", "--timeout", "0.05", &tab2]); // end()
+    let seen = f.sys.stop_lock_seen.borrow().clone();
+    assert!(seen.len() >= 2 && seen.iter().all(|h| *h), "{seen:?}");
 }

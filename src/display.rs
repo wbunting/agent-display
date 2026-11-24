@@ -586,8 +586,9 @@ pub fn wayvnc_argv(ctx: &Ctx, disp: &Disp, prefix: &[String], w: &Wayvnc) -> Res
 /// A viewer that just exited (its last client left) keeps its transient
 /// unit loaded while ExecStopPost runs, and systemd-run refuses the name
 /// meanwhile: wait that out (stop it, which waits for the stop to finish)
-/// and retry for up to ~5 s. If the unit is active again, another call has
-/// just started a viewer: leave it alone and fail with 75 (try again).
+/// and retry for up to ~5 s. If the unit is active instead, a viewer runs
+/// there (another `view`, or a viewer whose files were lost): leave it
+/// alone and fail with 75 (try again; `tab unshow` stops a lost one).
 pub fn start_wayvnc(ctx: &Ctx, unit: &str, argv: &[String], stop_post: Option<&[String]>, description: &str, ready: &dyn Fn() -> bool) -> Result<()> {
     let mut tries = 0;
     loop {
@@ -596,8 +597,11 @@ pub fn start_wayvnc(ctx: &Ctx, unit: &str, argv: &[String], stop_post: Option<&[
             Err(e) if e.msg.contains("already loaded") && tries < 25 => {
                 tries += 1;
                 if crate::systemd::unit_state(ctx, unit) == Some(true) {
-                    return Err(Error::new(format!("{unit} was just started by another call; try again"))
-                        .with_code(crate::util::exit::TEMPFAIL));
+                    return Err(Error::new(format!(
+                        "{unit} is already running (started by another call, or a viewer whose files are gone); \
+                         try again, or stop it with `agent-display tab unshow` / `agent-display unview`"
+                    ))
+                    .with_code(crate::util::exit::TEMPFAIL));
                 }
                 let _ = ctx.sys.stop_units(ctx, &[unit.to_string()]);
                 ctx.sys.sleep(0.2);

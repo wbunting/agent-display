@@ -150,6 +150,14 @@ pub struct FakeSys {
     /// Really sleep min(secs, cap) too (loops paced by sleep against a
     /// real deadline); default: sleeps are only recorded.
     pub real_sleep_cap: Option<f64>,
+    /// systemctl can't tell the state of units with this prefix (None).
+    pub unknown_prefix: RefCell<Option<String>>,
+    /// The next stop_units calls fail (systemctl stop error).
+    pub stop_fail: RefCell<bool>,
+    /// Units stopped and not started again since: inactive, as in systemd.
+    pub inactive: RefCell<std::collections::HashSet<String>>,
+    /// For each viewer stop: was its output's ViewerLock held.
+    pub stop_lock_seen: RefCell<Vec<bool>>,
     /// For each viewer start: (its state file existed, its output's
     /// ViewerLock was held) when systemd_run ran.
     pub viewer_start_seen: RefCell<Vec<(bool, bool)>>,
@@ -168,6 +176,13 @@ impl Sys for FakeSys {
         Ok(String::new())
     }
     fn unit_active(&self, _ctx: &Ctx, unit: &str) -> bool {
+        if self.inactive.borrow().contains(unit.trim_end_matches(".service")) {
+            return false;
+        }
+        // Like systemd::unit_active: an unknown state counts as not active.
+        if self.unknown_prefix.borrow().as_deref().is_some_and(|p| unit.starts_with(p)) {
+            return false;
+        }
         if let Some(v) = self.active_seq.borrow_mut().pop_front() {
             return v;
         }
@@ -180,12 +195,35 @@ impl Sys for FakeSys {
         if *self.states_unknown.borrow() {
             return vec![None; units.len()];
         }
-        units.iter().map(|u| Some(self.unit_active(ctx, u))).collect()
+        let unknown = self.unknown_prefix.borrow().clone();
+        units
+            .iter()
+            .map(|u| match &unknown {
+                Some(p) if u.starts_with(p.as_str()) => None,
+                _ => Some(self.unit_active(ctx, u)),
+            })
+            .collect()
     }
-    fn stop_units(&self, _ctx: &Ctx, units: &[String]) -> Result<()> {
-        if !units.is_empty() {
-            self.stopped.borrow_mut().push(units.to_vec());
+    fn stop_units(&self, ctx: &Ctx, units: &[String]) -> Result<()> {
+        if units.is_empty() {
+            return Ok(());
         }
+        for u in units {
+            if let Some(out) = u.strip_prefix("agent-display-vnc-") {
+                let lock = std::fs::File::open(ctx.vnc_dir().join(format!("{}.lock", out.to_ascii_uppercase()))).ok();
+                let held = lock.is_some_and(|f| {
+                    use std::os::fd::AsRawFd;
+                    // SAFETY: flock on a fd we own (closed on drop).
+                    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) != 0 }
+                });
+                self.stop_lock_seen.borrow_mut().push(held);
+            }
+        }
+        if *self.stop_fail.borrow() {
+            return Err(Error::new("systemctl --user stop: Connection timed out"));
+        }
+        self.stopped.borrow_mut().push(units.to_vec());
+        self.inactive.borrow_mut().extend(units.iter().map(|u| u.trim_end_matches(".service").to_string()));
         Ok(())
     }
     fn systemd_run(&self, _: &Ctx, unit: &str, argv: &[String], _: bool, _: Option<&[String]>, _: Option<&str>) -> Result<()> {
@@ -210,6 +248,7 @@ impl Sys for FakeSys {
         let mut v = vec![unit.to_string()];
         v.extend(argv.iter().cloned());
         self.systemd_runs.borrow_mut().push(v);
+        self.inactive.borrow_mut().remove(unit.trim_end_matches(".service"));
         // A started wayvnc makes its Unix socket.
         if let Some(i) = argv.iter().position(|a| a == "--unix-socket") {
             let sock = Path::new(&argv[i + 1]);
