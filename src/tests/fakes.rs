@@ -144,6 +144,9 @@ pub struct FakeSys {
     /// Scripted wayvnc viewer events (then Closed); `vnc_events` calls.
     pub vnc_script: RefCell<VecDeque<VncEvent>>,
     pub vnc_opened: RefCell<Vec<PathBuf>>,
+    /// The next N systemd_run calls fail like systemd-run for a transient
+    /// unit that is still loaded (a viewer still running ExecStopPost).
+    pub run_still_loaded: RefCell<usize>,
     /// Really sleep min(secs, cap) too (loops paced by sleep against a
     /// real deadline); default: sleeps are only recorded.
     pub real_sleep_cap: Option<f64>,
@@ -183,6 +186,15 @@ impl Sys for FakeSys {
         Ok(())
     }
     fn systemd_run(&self, _: &Ctx, unit: &str, argv: &[String], _: bool, _: Option<&[String]>, _: Option<&str>) -> Result<()> {
+        {
+            let mut n = self.run_still_loaded.borrow_mut();
+            if *n > 0 {
+                *n -= 1;
+                return Err(Error::new(format!(
+                    "systemd-run --user --quiet --collect --unit={unit} ...: Failed to start transient service unit: Unit {unit}.service was already loaded or has a fragment file."
+                )));
+            }
+        }
         let mut v = vec![unit.to_string()];
         v.extend(argv.iter().cloned());
         self.systemd_runs.borrow_mut().push(v);

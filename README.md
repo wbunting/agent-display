@@ -95,7 +95,10 @@ sequence of blocking request/response steps with deadlines.
    wayvnc's own kill timer runs 2 s later, so a waiting `show` exits 3
    first). Showing a tab that is already shown reports the running
    viewer's mode and remaining time, refuses a different `--view-only`
-   mode, and never stops a viewer it didn't start.
+   mode, and never stops a viewer it didn't start (each viewer's state
+   file holds a random token; a `show` stops a viewer only while the file
+   still holds the token it wrote). Re-showing right after a viewer exited
+   waits out its still-stopping unit.
    `--wait-viewer`, `--until-url REGEX` and `--until-closed` keep it in the
    foreground, printing `{"viewer": "connected"}` / `"disconnected"` JSON
    lines and ending the view on the condition (the URL is never printed).

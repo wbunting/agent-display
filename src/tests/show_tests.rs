@@ -427,3 +427,112 @@ fn wait_viewer_alone_still_ends_on_disconnect() {
     assert_eq!(code, 0);
     assert_eq!(lines(&out).last().unwrap(), &json!({"unshown": tab, "reason": "disconnected"}));
 }
+
+// ------------------------------------------------------------ ownership
+// A `show` stops only the viewer it started, and only while it still runs:
+// never a later viewer on the same output.
+
+/// From the Nth getTargetInfo on: "our viewer exited (its ExecStopPost
+/// cleared its files) and another `show` started a new one" on HEADLESS-2.
+fn replace_viewer_after(f: &Fx, n: usize) -> std::path::PathBuf {
+    let state = f.t.rt.join("agent-display/vnc/HEADLESS-2.json");
+    let st = state.clone();
+    let mut calls = 0;
+    f.b.set_hook(move |m, _| {
+        if m == "Target.getTargetInfo" {
+            calls += 1;
+            if calls == n {
+                std::fs::write(&st, r#"{"view_only": false, "expires": 9999999999.0, "token": "othershow0000000"}"#).unwrap();
+            }
+        }
+        Hook::Pass
+    });
+    state
+}
+
+#[test]
+fn until_waiter_never_stops_a_later_viewer_on_the_same_output() {
+    // The reviewer's case: --until-url, the human leaves (our viewer
+    // exits), the agent re-shows the tab (new viewer), then the first
+    // waiter times out. The new viewer must survive.
+    let mut f = fx();
+    f.sys.real_sleep_cap = Some(0.01);
+    let (tab, _) = opened(&f);
+    let state = replace_viewer_after(&f, 4);
+    f.sys.vnc_script.borrow_mut().extend([ev("client-connected", 1), ev("client-disconnected", 0), VncEvent::Closed]);
+    let (code, out, err) = f.cli(&["show", "--until-url", "/home", "--timeout", "1.5", &tab]);
+    assert_eq!(code, 3, "{err}");
+    assert_eq!(lines(&out).last().unwrap(), &json!({"unshown": tab, "reason": "timeout"}));
+    assert!(stopped(&f).is_empty(), "stopped someone else's viewer: {:?}", stopped(&f));
+    assert!(std::fs::read_to_string(&state).unwrap().contains("othershow0000000"));
+}
+
+#[test]
+fn waiter_never_stops_a_viewer_that_replaced_its_own() {
+    // Same output, ours replaced while the waiter still runs (another
+    // agent's `unshow` + `show`): the token in the state file is no longer
+    // ours, so the waiter's end leaves the new viewer alone.
+    let mut f = fx();
+    f.sys.real_sleep_cap = Some(0.01);
+    let (tab, _) = opened(&f);
+    replace_viewer_after(&f, 2);
+    f.sys.vnc_script.borrow_mut().extend([VncEvent::Idle, VncEvent::Closed]);
+    let (code, _, err) = f.cli(&["show", "--wait-viewer", "--timeout", "0.3", &tab]);
+    assert_eq!(code, 3, "{err}");
+    assert!(stopped(&f).is_empty(), "{:?}", stopped(&f));
+}
+
+#[test]
+fn starter_still_stops_its_own_viewer_and_records_a_token() {
+    let f = fx();
+    let (tab, _) = opened(&f);
+    f.sys.vnc_script.borrow_mut().extend([ev("client-connected", 1)]);
+    let (code, _, _) = f.cli(&["show", "--wait-viewer", "--timeout", "0.05", &tab]);
+    assert_eq!(code, 3);
+    assert_eq!(stopped(&f), vec!["agent-display-vnc-headless-2"]);
+    // A fresh start records a new token.
+    assert_eq!(f.cli(&["show", &tab]).0, 0);
+    let st: Value =
+        serde_json::from_str(&std::fs::read_to_string(f.t.rt.join("agent-display/vnc/HEADLESS-2.json")).unwrap()).unwrap();
+    assert_eq!(st["token"].as_str().unwrap().len(), 16);
+}
+
+#[test]
+fn reshow_waits_out_a_viewer_that_is_still_stopping() {
+    // Found live: right after the last client leaves, the old transient
+    // unit is still loaded (ExecStopPost); systemd-run refuses the name.
+    let mut f = fx();
+    let (tab, _) = opened(&f);
+    *f.sys.run_still_loaded.borrow_mut() = 2;
+    // Not active (stopping): wait it out, then start.
+    f.sys.active_fn = Some(Box::new(|u| !u.starts_with("agent-display-vnc-")));
+    f.sys.active = None;
+    let (code, out, err) = f.cli(&["show", &tab]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(lines(&out)[0]["already_shown"], false);
+    assert_eq!(stopped(&f), vec!["agent-display-vnc-headless-2", "agent-display-vnc-headless-2"]);
+    assert_eq!(f.sys.sleeps.borrow().iter().filter(|s| **s == 0.2).count(), 2);
+}
+
+#[test]
+fn reshow_never_stops_a_viewer_another_call_just_started() {
+    let mut f = fx();
+    let (tab, _) = opened(&f);
+    *f.sys.run_still_loaded.borrow_mut() = 1;
+    // Inactive when we checked, active by the time systemd-run refused:
+    // another `show` won the race. Leave its viewer alone; 75.
+    let checks = std::rc::Rc::new(std::cell::Cell::new(0));
+    let c2 = checks.clone();
+    f.sys.active_fn = Some(Box::new(move |u| {
+        if !u.starts_with("agent-display-vnc-") {
+            return true;
+        }
+        c2.set(c2.get() + 1);
+        c2.get() > 1
+    }));
+    f.sys.active = None;
+    let (code, _, err) = f.cli(&["show", &tab]);
+    assert_eq!(code, 75, "{err}");
+    assert!(err.contains("was just started by another call; try again"), "{err}");
+    assert!(stopped(&f).is_empty(), "{:?}", stopped(&f));
+}

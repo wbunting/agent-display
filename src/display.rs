@@ -582,8 +582,29 @@ pub fn wayvnc_argv(ctx: &Ctx, disp: &Disp, prefix: &[String], w: &Wayvnc) -> Res
 
 /// Run `argv` as `unit` (bound to the display) and wait up to 10 s for
 /// `ready`. If it never gets ready, stop the unit and fail with its log.
+///
+/// A viewer that just exited (its last client left) keeps its transient
+/// unit loaded while ExecStopPost runs, and systemd-run refuses the name
+/// meanwhile: wait that out (stop it, which waits for the stop to finish)
+/// and retry for up to ~5 s. If the unit is active again, another call has
+/// just started a viewer: leave it alone and fail with 75 (try again).
 pub fn start_wayvnc(ctx: &Ctx, unit: &str, argv: &[String], stop_post: Option<&[String]>, description: &str, ready: &dyn Fn() -> bool) -> Result<()> {
-    ctx.sys.systemd_run(ctx, unit, argv, true, stop_post, Some(description))?;
+    let mut tries = 0;
+    loop {
+        match ctx.sys.systemd_run(ctx, unit, argv, true, stop_post, Some(description)) {
+            Ok(()) => break,
+            Err(e) if e.msg.contains("already loaded") && tries < 25 => {
+                tries += 1;
+                if crate::systemd::unit_state(ctx, unit) == Some(true) {
+                    return Err(Error::new(format!("{unit} was just started by another call; try again"))
+                        .with_code(crate::util::exit::TEMPFAIL));
+                }
+                let _ = ctx.sys.stop_units(ctx, &[unit.to_string()]);
+                ctx.sys.sleep(0.2);
+            }
+            Err(e) => return Err(e),
+        }
+    }
     let deadline = Instant::now() + Duration::from_secs(10);
     while !ready() {
         if Instant::now() > deadline || !ctx.sys.unit_active(ctx, unit) {

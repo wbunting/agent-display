@@ -271,6 +271,26 @@ cat "$E2E_OUT/show5.jsonl"; echo "[exit $src after $((SECONDS - s)) s]"
 check "until-url not met, viewer gone: exit 3, reason timeout (not disconnected/0)" bash -c "test $src -eq 3 && grep -q '\"reason\": \"timeout\"' '$E2E_OUT/show5.jsonl'"
 check "no viewer left" test "$(active_viewers)" -eq 0
 
+echo "-- a waiter whose viewer left never stops the next viewer on that output"
+ad tab show "$A" --until-url '/home\.html' --timeout 8 > "$E2E_OUT/show6.jsonl" &
+SP=$!
+for _ in $(seq 50); do [ -s "$E2E_OUT/show6.jsonl" ] && break; sleep 0.1; done
+SOCK=$(head -1 "$E2E_OUT/show6.jsonl" | jq -r .socket)
+timeout 30 python3 -I "$HERE/rfb.py" "unix:$SOCK" "$E2E_OUT/show6-frame.png" --hold 0.5 > /dev/null 2>&1
+for _ in $(seq 50); do grep -q '"viewer": "stopped"' "$E2E_OUT/show6.jsonl" && break; sleep 0.1; done
+run ad tab show "$A" --timeout 60
+check "re-show after the human left starts a new viewer" bash -c "test $rc -eq 0 && test $(active_viewers) -eq 1"
+NEWTOKEN=$(jq -r .token "$E2E_ROOT/run/agent-display/vnc/$AO.json")
+wait "$SP"; src=$?
+cat "$E2E_OUT/show6.jsonl"; echo "[first waiter exit $src]"
+check "first waiter timed out (3)" test "$src" -eq 3
+check "the new viewer is still running" test "$(active_viewers)" -eq 1 -a -S "$SOCK"
+check "and still the new one (same token)" test "$(jq -r .token "$E2E_ROOT/run/agent-display/vnc/$AO.json" 2>/dev/null)" = "$NEWTOKEN"
+run timeout 30 python3 -I "$HERE/rfb.py" "unix:$SOCK" "$E2E_OUT/show6b-frame.png" --hold 0.3
+check "a human can still connect to it" test "$rc" -eq 0
+sleep 1
+check "and it exits after that human leaves" test "$(active_viewers)" -eq 0
+
 echo "-- show --timeout while a human is still connected: exit 3, viewer stopped"
 s=$SECONDS
 ad tab show "$A" --wait-viewer --timeout 4 > "$E2E_OUT/show3.jsonl" &
