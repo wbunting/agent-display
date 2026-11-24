@@ -1,8 +1,13 @@
 """Regenerate src/cli_text.rs from the Python reference's argparse parser.
 
 Historical: it produced the table at the port. The Rust tool is canonical
-now and has subcommands the Python lacks (`tab show`, `tab unshow`), so
-running this would drop them; edit src/cli_text.rs by hand instead.
+now and has commands and options the Python lacks (`tab show/unshow/wait/
+type/click/snapshot`, `--show-url`, ...), so running this would drop them.
+Entries the Python predates stay as this script wrote them; the entries
+for commands added or changed in Rust come from tools/gen_cli_text_rust.py
+(edit it, then run `python3 -I tools/gen_cli_text_rust.py src/cli_text.rs`;
+`--check` tells whether the file is current). Don't edit src/cli_text.rs
+by hand.
 
 usage: COLUMNS=80 python3 -I tools/gen_cli_text.py PATH/TO/agent-display > src/cli_text.rs
 

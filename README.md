@@ -26,7 +26,8 @@ are shared).
   commands added or changed in Rust since (`tab` and its subcommands,
   `windows`, `browser start`, `view`) come from
   `python3 -I tools/gen_cli_text_rust.py src/cli_text.rs` (argparse, same
-  format; `--check` tells whether the file is current).
+  format; `--check` tells whether the file is current, and a unit test runs
+  it with python3 >= 3.14). Edit the generator, not `cli_text.rs`.
 - The sway config's `exec ... hold-input` runs this binary.
 - `type` splits text into wtype runs in-tree (ported from the `host-gui`
   skill, which the Python imports at runtime).
@@ -261,7 +262,7 @@ still match the full URL in the page. See [docs/tab-wait.md](docs/tab-wait.md).
   against a scripted page with fake time and its in-page checker in node
   (skipped without node), dialog handling on a socket pair and in
   `goto`/`eval`/`shot`/`info`, and the `tab type/click/snapshot`, URL
-  redaction and browser hygiene tests (350 in all).
+  redaction and browser hygiene tests (351 in all).
 - `cargo clippy --all-targets --features bench-trace -- -D warnings`: clean.
 - Live: `status`, `start` (already running), persistent `browser start`
   (`already_running`), `browser start --temp` / `browser stop UNIT`

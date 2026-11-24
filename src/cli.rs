@@ -1,8 +1,13 @@
 //! Command line, parsed the way the Python's argparse parser does it, so
 //! flags, positionals, abbreviations, `--`, usage errors (exit 2) and `-h`
 //! behave and print the same. Usage/help texts live in `cli_text.rs`
-//! (argparse's format; generated from the Python parser at the port, edited
-//! by hand since: a test checks each parser here has a matching entry).
+//! (argparse's format). Entries the Python predates stay as
+//! tools/gen_cli_text.py generated them at the port; entries for commands
+//! added or changed in Rust (`tab` and its subcommands, `windows`,
+//! `browser start`, `view`) come from tools/gen_cli_text_rust.py: edit that
+//! script, then run `python3 -I tools/gen_cli_text_rust.py src/cli_text.rs`.
+//! Tests check every parser has a matching entry and that the file is what
+//! the generator writes.
 
 use std::collections::{HashMap, HashSet};
 
@@ -1139,8 +1144,9 @@ mod tests {
         TabOpts { port: None, port_raw: None, timeout: 30.0, show_url: false }
     }
 
-    /// Every command and subcommand has its usage and help text (new ones
-    /// are edited by hand in src/cli_text.rs), and `-h` prints it.
+    /// Every command and subcommand has its usage and help text, and `-h`
+    /// prints it. Texts for Rust-owned commands come from
+    /// tools/gen_cli_text_rust.py (see the module doc), not hand edits.
     #[test]
     fn every_command_has_help() {
         fn walk(p: &Parser, out: &mut Vec<String>) {
@@ -1350,14 +1356,19 @@ mod tests {
         assert!(p("tab|show").unwrap_err().stderr.starts_with("usage: agent-display tab show [-h] [--port PORT]"));
     }
 
-    /// cli_text.rs is maintained by hand now: every parser must have an
-    /// entry whose usage names all its options, positionals and subcommands.
+    /// Every parser must have a cli_text.rs entry whose usage names all its
+    /// options, positionals and subcommands. Add or change one in
+    /// tools/gen_cli_text_rust.py and run it (see the module doc).
     #[test]
     fn every_parser_has_matching_help_text() {
         fn walk(p: &Parser, n: &mut usize) {
             *n += 1;
             let (usage, help) = texts(&p.prog);
-            assert!(!usage.is_empty() && !help.is_empty(), "no cli_text entry for {:?}", p.prog);
+            assert!(
+                !usage.is_empty() && !help.is_empty(),
+                "no cli_text entry for {:?}: add it to tools/gen_cli_text_rust.py, then run python3 -I tools/gen_cli_text_rust.py src/cli_text.rs",
+                p.prog
+            );
             assert!(usage.starts_with(&format!("usage: {} [-h]", p.prog)), "{usage}");
             assert!(help.starts_with(usage), "{}: help must start with usage", p.prog);
             let flat = usage.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1379,6 +1390,34 @@ mod tests {
         let mut n = 0;
         walk(&build(), &mut n);
         assert_eq!(n, TEXTS.len(), "cli_text.rs has entries for parsers that don't exist");
+    }
+
+    /// cli_text.rs is exactly what tools/gen_cli_text_rust.py writes, so a
+    /// hand edit to a generated entry (which the next run would silently
+    /// drop) fails here. argparse wraps differently across Python versions
+    /// and the texts were written with 3.14: skipped (with a note) without
+    /// python3 >= 3.14.
+    #[test]
+    fn cli_text_is_what_the_generator_writes() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let py = std::process::Command::new("python3")
+            .args(["-I", "-c", "import sys; print(sys.version_info >= (3, 14))"])
+            .output();
+        if !py.as_ref().is_ok_and(|o| o.status.success() && o.stdout.starts_with(b"True")) {
+            eprintln!("cli_text_is_what_the_generator_writes: python3 >= 3.14 not found; skipped");
+            return;
+        }
+        let out = std::process::Command::new("python3")
+            .current_dir(root)
+            .args(["-I", "tools/gen_cli_text_rust.py", "--check", "src/cli_text.rs"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "src/cli_text.rs differs from what tools/gen_cli_text_rust.py writes (edit the generator, not the file, \
+             then run python3 -I tools/gen_cli_text_rust.py src/cli_text.rs):\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     #[test]
