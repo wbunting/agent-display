@@ -145,6 +145,13 @@ pub struct FakeSys {
     /// Scripted wayvnc viewer events (then Closed); `vnc_events` calls.
     pub vnc_script: RefCell<VecDeque<VncEvent>>,
     pub vnc_opened: RefCell<Vec<PathBuf>>,
+    /// The `wait` flag of each vnc_events call.
+    pub vnc_waits: RefCell<Vec<bool>>,
+    /// Scripts for later vnc_events calls (reopened streams), in order;
+    /// none left: a stream that is Closed at once (wayvncctl failed).
+    pub vnc_more_scripts: RefCell<VecDeque<Vec<VncEvent>>>,
+    /// unit_active_state calls for viewer units (systemctl spawns).
+    pub vnc_state_checks: RefCell<usize>,
     /// The next N systemd_run calls fail like systemd-run for a transient
     /// unit that is still loaded (a viewer still running ExecStopPost).
     pub run_still_loaded: RefCell<usize>,
@@ -311,12 +318,22 @@ impl Sys for FakeSys {
         *self.owner_checks.borrow_mut() += 1;
         self.owner_ok.as_ref().is_some_and(|f| f(owner))
     }
-    fn vnc_events(&self, _ctx: &Ctx, ctl: &Path) -> Result<Box<dyn VncEvents>> {
+    fn vnc_events(&self, _ctx: &Ctx, ctl: &Path, wait: bool) -> Result<Box<dyn VncEvents>> {
+        let first = self.vnc_opened.borrow().is_empty();
         self.vnc_opened.borrow_mut().push(ctl.to_path_buf());
-        Ok(Box::new(FakeVnc(std::mem::take(&mut *self.vnc_script.borrow_mut()))))
+        self.vnc_waits.borrow_mut().push(wait);
+        let script: VecDeque<VncEvent> = if first {
+            std::mem::take(&mut *self.vnc_script.borrow_mut())
+        } else {
+            self.vnc_more_scripts.borrow_mut().pop_front().unwrap_or_default().into()
+        };
+        Ok(Box::new(FakeVnc(script)))
     }
     fn unit_active_state(&self, ctx: &Ctx, unit: &str) -> Option<String> {
         let u = unit.trim_end_matches(".service");
+        if u.starts_with("agent-display-vnc-") {
+            *self.vnc_state_checks.borrow_mut() += 1;
+        }
         if *self.states_unknown.borrow() || self.unknown_prefix.borrow().as_deref().is_some_and(|p| u.starts_with(p)) {
             return None;
         }

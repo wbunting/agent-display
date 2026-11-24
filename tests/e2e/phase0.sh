@@ -397,6 +397,23 @@ wait "$OP"; orc=$?
 cat "$E2E_OUT/owner.jsonl" | tail -1; echo "[owner exit $orc]"
 check "the owner's wait ends when the viewer is unshown" bash -c "test $orc -eq 0 && test $(active_viewers) -eq 0"
 
+echo "-- wayvncctl dies while wayvnc runs: the stream is reopened, later viewer events are seen"
+ad tab goto "$A" "http://127.0.0.1:$HP/handoff.html" >/dev/null
+ad tab show "$A" --wait-viewer --timeout 60 > "$E2E_OUT/reopen.jsonl" 2>&1 &
+SP=$!
+for _ in $(seq 50); do [ -s "$E2E_OUT/reopen.jsonl" ] && break; sleep 0.1; done
+CTL="$E2E_ROOT/run/agent-display/vnc/$AO.ctl"
+for _ in $(seq 50); do pgrep -f "wayvncctl -S $CTL -w" >/dev/null && break; sleep 0.1; done
+pkill -f "wayvncctl -S $CTL -w"
+sleep 1.5
+check "after the kill the show waits on, with a reopened stream (no -w)" bash -c "kill -0 $SP && pgrep -f 'wayvncctl -S $CTL -j' >/dev/null"
+run timeout 30 python3 -I "$HERE/rfb.py" "unix:$SOCK" "$E2E_OUT/reopen-frame.png" --hold 0.5
+wait "$SP"; src=$?
+cat "$E2E_OUT/reopen.jsonl" | cut -c1-140; echo "[show exit $src]"
+check "the viewer's connect and disconnect are still reported" bash -c "grep -q '\"viewer\": \"connected\"' '$E2E_OUT/reopen.jsonl' && grep -q '\"viewer\": \"disconnected\"' '$E2E_OUT/reopen.jsonl'"
+check "and the view ends on the disconnect (exit 0, unshown)" bash -c "test $src -eq 0 && tail -1 '$E2E_OUT/reopen.jsonl' | grep -q '\"unshown\".*\"reason\": \"disconnected\"'"
+check "no wayvncctl left behind" not pgrep -f "wayvncctl -S $CTL"
+
 echo "-- two concurrent shows of one tab: one viewer, both see its options"
 ad tab show "$A" > "$E2E_OUT/c1.json" 2>&1 & C1=$!
 ad tab show "$A" > "$E2E_OUT/c2.json" 2>&1 & C2=$!
@@ -453,11 +470,22 @@ run ad tab unshow "$A"
 echo
 echo "== 5. view --exit-on-disconnect (whole display, loopback TCP)"
 VP=$(free_port)
-run ad view --exit-on-disconnect --port "$VP"
+VOUT=$(ad view --exit-on-disconnect --port "$VP"); echo "$VOUT"
+check "view started with the flag says it stops by itself (no hedge)" \
+    bash -c "grep -qx 'It stops by itself when the last viewer disconnects.' <<<'$VOUT' && ! grep -q 'if it was started' <<<'$VOUT'"
+VOUT=$(ad view --port "$VP"); echo "$VOUT"
+check "reused, it still says it stops by itself" grep -qx 'It stops by itself when the last viewer disconnects.' <<<"$VOUT"
 run timeout 30 python3 -I "$HERE/rfb.py" "tcp:127.0.0.1:$VP" "$E2E_OUT/view-frame.png" --hold 0.5
 sleep 1
 check "view stopped by itself after the viewer left" test "$(nsys is-active agent-display-vnc.service)" != active
 check "its port is free again" test -z "$(ss -Hltn "sport = :$VP")"
+VP=$(free_port)
+run ad view --port "$VP"
+VOUT=$(ad view --exit-on-disconnect --port "$VP"); echo "$VOUT"
+check "flag on a viewer started without it: said plainly, no stop promised" \
+    bash -c "grep -q 'was started without --exit-on-disconnect and keeps its options' <<<'$VOUT' && ! grep -q 'It stops by itself' <<<'$VOUT'"
+run ad unview
+check "unview stops it" test "$(nsys is-active agent-display-vnc.service)" != active
 
 echo
 echo "== 6. gone: a real tab close, then lookups say 4"

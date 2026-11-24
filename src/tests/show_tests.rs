@@ -1207,3 +1207,89 @@ fn polls_timing_out_past_stall_recheck_look_the_tab_up_again() {
     assert_eq!(lines(&out).last().unwrap(), &json!({"unshown": tab, "reason": "browser-down"}));
     assert!((5.0..10.0).contains(&took), "after the 5 s recheck, not before and not at --timeout: {took}");
 }
+
+// ------------------------------------------------------------ broken event stream
+// wayvncctl ends while wayvnc keeps running: reopen the stream (without
+// -w), so later viewer events are seen; back off the systemctl checks.
+
+#[test]
+fn broken_event_stream_is_reopened_and_later_viewer_events_are_seen() {
+    let mut f = fx();
+    f.sys.real_sleep_cap = Some(0.01);
+    let (tab, _) = opened(&f);
+    // The first stream breaks at once (wayvncctl died); the viewer runs on.
+    f.sys.vnc_script.borrow_mut().extend([VncEvent::Closed]);
+    f.sys.vnc_more_scripts.borrow_mut().push_back(vec![ev("client-connected", 1), ev("client-disconnected", 0)]);
+    let (code, out, err) = f.cli(&["show", "--wait-viewer", "--timeout", "3", &tab]);
+    assert_eq!(code, 0, "{err}");
+    let l = lines(&out);
+    assert_eq!(&l[1..], &[
+        json!({"viewer": "connected", "clients": 1}),
+        json!({"viewer": "disconnected", "clients": 0}),
+        json!({"unshown": tab, "reason": "disconnected"}),
+    ]);
+    // Reopened without -w (fails at once if wayvnc is gone).
+    assert_eq!(*f.sys.vnc_waits.borrow(), vec![true, false]);
+}
+
+#[test]
+fn broken_event_stream_backs_off_its_systemctl_checks() {
+    // wayvncctl keeps failing while the unit stays active, until the view's
+    // --timeout: a handful of state checks (0.5 s, 1 s, 2 s ... apart),
+    // not one per 0.5 s poll for the whole view.
+    let mut f = fx();
+    f.sys.real_sleep_cap = Some(0.01);
+    let (tab, _) = opened(&f);
+    f.sys.vnc_script.borrow_mut().extend([VncEvent::Closed]);
+    *f.sys.vnc_state_checks.borrow_mut() = 0;
+    let (code, out, err) = f.cli(&["show", "--wait-viewer", "--timeout", "4", &tab]);
+    assert_eq!(code, 3, "{err}");
+    assert_eq!(lines(&out).last().unwrap(), &json!({"unshown": tab, "reason": "timeout"}));
+    let checks = *f.sys.vnc_state_checks.borrow();
+    // show's start decision, then 0 s, 0.5 s, 1.5 s, 3.5 s at most, end().
+    assert!(checks <= 8, "{checks} systemctl calls");
+    let reopens = f.sys.vnc_waits.borrow().iter().filter(|w| !**w).count();
+    assert!((1..=2).contains(&reopens), "{reopens} reopens");
+}
+
+// ------------------------------------------------------------ view --exit-on-disconnect
+
+fn view(f: &Fx, args: &[&str]) -> (i32, String, String) {
+    let mut a = vec!["view", "--port", "5999"];
+    a.extend_from_slice(args);
+    f.t.cli(&f.sys, &a)
+}
+
+#[test]
+fn view_says_what_the_running_viewer_actually_does() {
+    let mut f = fx();
+    let _ = opened(&f); // a running display has its runtime dir
+    f.sys.port_free = Some(true);
+    // Not running yet: this call starts it, with the flag.
+    f.sys.active_fn = Some(Box::new(|u| u.trim_end_matches(".service") != "agent-display-vnc"));
+    f.sys.active = None;
+    let (code, out, err) = view(&f, &["--exit-on-disconnect"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("It stops by itself when the last viewer disconnects.\n"), "{out}");
+    assert!(!out.contains("if it was started"), "no hedge: {out}");
+    let run = f.sys.systemd_runs.borrow().last().unwrap().clone();
+    assert!(run.contains(&"--exit-on-disconnect".to_string()));
+    // Reused: it was started with the flag, and says so even if not asked.
+    f.sys.active_fn = None;
+    f.sys.active = Some(true);
+    let (_, out, _) = view(&f, &[]);
+    assert!(out.contains("It stops by itself when the last viewer disconnects."), "{out}");
+    // unview forgets it; started again without the flag, then reused with
+    // it: the flag can't apply, and that is said plainly.
+    assert_eq!(f.t.cli(&f.sys, &["unview"]).0, 0);
+    f.sys.active_fn = Some(Box::new(|u| u.trim_end_matches(".service") != "agent-display-vnc"));
+    f.sys.active = None;
+    let (_, out, _) = view(&f, &[]);
+    assert!(!out.contains("stops by itself"), "{out}");
+    f.sys.active_fn = None;
+    f.sys.active = Some(true);
+    let (code, out, _) = view(&f, &["--exit-on-disconnect"]);
+    assert_eq!(code, 0);
+    assert!(out.contains("was started without --exit-on-disconnect and keeps its options"), "{out}");
+    assert!(out.contains("`agent-display unview` first"), "{out}");
+}

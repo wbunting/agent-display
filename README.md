@@ -132,8 +132,13 @@ sequence of blocking request/response steps with deadlines.
    end it) and ends it. A viewer another waiting show owns is left to that
    one; the last line then says so (`{"done": TAB, "reason": ...,
    "still_shown": true}`) instead of `unshown`.
-   `tab close` and the output gc stop a tab's viewer. `view` gained
-   `--exit-on-disconnect`.
+   `tab close` and the output gc stop a tab's viewer. If the viewer
+   event stream (`wayvncctl`) dies while wayvnc runs, it is reopened
+   (without `-w`, so it ends at once if wayvnc is gone) and the unit's
+   state is checked with a backoff (0.5 s up to 5 s), not every poll.
+   `view` gained `--exit-on-disconnect`; reusing a running `view` says
+   whether that viewer stops by itself (it keeps the options it was
+   started with).
 
 Also: sway IPC over `SWAYSOCK` instead of `swaymsg` subprocesses (and a
 5 ms window poll in `tab open`/`close` instead of 20 ms); one `systemctl show`

@@ -216,8 +216,10 @@ pub trait Sys {
         crate::tab::find_window_real(ctx, disp, title, timeout)
     }
     /// Viewer events of the wayvnc behind control socket `ctl`.
-    fn vnc_events(&self, ctx: &Ctx, ctl: &Path) -> Result<Box<dyn crate::show::VncEvents>> {
-        crate::show::vnc_events_real(ctx, ctl)
+    /// `wait`: wait for the control socket to appear (a viewer just
+    /// started); otherwise fail at once if wayvnc isn't there.
+    fn vnc_events(&self, ctx: &Ctx, ctl: &Path, wait: bool) -> Result<Box<dyn crate::show::VncEvents>> {
+        crate::show::vnc_events_real(ctx, ctl, wait)
     }
     fn sleep(&self, secs: f64) {
         std::thread::sleep(std::time::Duration::from_secs_f64(secs.max(0.0)));

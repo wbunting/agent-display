@@ -58,13 +58,9 @@ pub fn dbus_config(runtime: &Path) -> String {
 }
 
 pub fn ensure_runtime_dir(ctx: &Ctx) -> Result<PathBuf> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    use std::os::unix::fs::MetadataExt;
     let rt = ctx.runtime_dir();
-    match std::fs::DirBuilder::new().mode(0o700).create(&rt) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(e.into()),
-    }
+    crate::util::mkdir_private(&rt)?;
     let st = std::fs::metadata(&rt)?;
     if st.uid() != ctx.uid || st.mode() & 0o077 != 0 {
         bail!("{} must be owned by you with mode 0700", rt.display());
@@ -281,7 +277,7 @@ pub fn cmd_stop(ctx: &Ctx) -> Result<i32> {
     let disp: Vec<String> = rest.iter().filter(|u| *u == DISPLAY_UNIT).cloned().collect();
     ctx.sys.stop_units(ctx, &disp)?;
     let rt = ctx.runtime_dir();
-    for name in ["env", "env.tmp", "vnc.port"] {
+    for name in ["env", "env.tmp", "vnc.port", "vnc.exit-on-disconnect"] {
         unlink_missing_ok(&rt.join(name));
     }
     let _ = std::fs::remove_dir_all(ctx.tab_outputs_dir());
@@ -632,11 +628,18 @@ pub fn start_wayvnc(ctx: &Ctx, unit: &str, argv: &[String], stop_post: Option<&[
     Ok(())
 }
 
+/// Marks a running `view` viewer that was started with --exit-on-disconnect
+/// (so a later `view` reusing it can say whether it stops by itself).
+fn view_exits_marker(ctx: &Ctx) -> PathBuf {
+    ctx.runtime_dir().join("vnc.exit-on-disconnect")
+}
+
 pub fn cmd_view(ctx: &Ctx, mut port: i64, view_only: bool, exit_on_disconnect: bool) -> Result<i32> {
     require(ctx, &["wayvnc"])?;
     let disp = display(ctx)?;
     let port_file = ctx.runtime_dir().join("vnc.port");
-    if ctx.sys.unit_active(ctx, VNC_UNIT) {
+    let reused = ctx.sys.unit_active(ctx, VNC_UNIT);
+    if reused {
         let current = std::fs::read_to_string(&port_file).ok().and_then(|s| s.trim().parse::<i64>().ok());
         let Some(current) = current else {
             bail!("{VNC_UNIT} is running on an unknown port; run `agent-display unview` first");
@@ -656,14 +659,26 @@ pub fn cmd_view(ctx: &Ctx, mut port: i64, view_only: bool, exit_on_disconnect: b
             listen: &["127.0.0.1".into(), port.to_string()],
         })?;
         let ready = || ctx.sys.listener_in_unit(ctx, port as u16, &unit_name(VNC_UNIT));
+        unlink_missing_ok(&view_exits_marker(ctx));
         start_wayvnc(ctx, VNC_UNIT, &argv, None, "Agent display VNC viewer (loopback)", &ready)?;
         write_private(&port_file, &port.to_string())?;
+        if exit_on_disconnect {
+            write_private(&view_exits_marker(ctx), "")?;
+        }
     }
     ctx.println(&format!(
         "VNC on 127.0.0.1:{port} (loopback only). Will can run:\n  vncviewer 127.0.0.1::{port}\nStop with: agent-display unview"
     ));
-    if exit_on_disconnect {
-        ctx.println("It stops by itself when the last viewer disconnects (if it was started with --exit-on-disconnect).");
+    // Say what the running viewer will actually do: a reused one keeps the
+    // options it was started with.
+    let exits = view_exits_marker(ctx).exists();
+    if exits {
+        ctx.println("It stops by itself when the last viewer disconnects.");
+    } else if reused && exit_on_disconnect {
+        ctx.println(
+            "The running viewer was started without --exit-on-disconnect and keeps its options: it stays up \
+             after viewers leave. Run `agent-display unview` first to restart it with --exit-on-disconnect.",
+        );
     }
     Ok(0)
 }
@@ -672,6 +687,7 @@ pub fn cmd_unview(ctx: &Ctx) -> Result<i32> {
     let units = if ctx.sys.unit_active(ctx, VNC_UNIT) { vec![VNC_UNIT.to_string()] } else { vec![] };
     ctx.sys.stop_units(ctx, &units)?;
     unlink_missing_ok(&ctx.runtime_dir().join("vnc.port"));
+    unlink_missing_ok(&view_exits_marker(ctx));
     ctx.println("viewer stopped");
     Ok(0)
 }

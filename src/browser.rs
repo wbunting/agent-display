@@ -318,14 +318,7 @@ pub fn cmd_browser_start(ctx: &Ctx, temp: bool, port_arg: Option<i64>, audio: bo
     };
     let info = Value::Object(info_json(&unit, actual.into(), &profile, temp));
     let dir = ctx.browsers_dir();
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e.into()),
-        }
-    }
+    crate::util::mkdir_private(&dir)?;
     write_private(&dir.join(format!("{unit}.json")), &json::dumps(&info, true))?;
     ctx.println(&json::dumps(&info, true));
     Ok(0)

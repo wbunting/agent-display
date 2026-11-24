@@ -344,6 +344,17 @@ pub fn hex(data: &[u8]) -> String {
 
 // ------------------------------------------------------------ files
 
+/// Create directory `path` with mode 0700; an existing one is fine (its
+/// mode is not changed: callers that require 0700 check it).
+pub fn mkdir_private(path: &Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    match std::fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// An exclusive `flock` on `path` (created 0600 if missing), held until
 /// dropped. Blocks until it is free; retries on EINTR.
 pub struct FileLock {

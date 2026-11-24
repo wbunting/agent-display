@@ -32,7 +32,7 @@ use crate::cli::{ShowOpts, TabOpts};
 use crate::ctx::*;
 use crate::display::{Wayvnc, display, start_wayvnc, wayvnc_argv};
 use crate::tab::{Found, GONE_RECHECK, lookup, marked_outputs, no_such_target, output_windows, owned_ports, tab_alive, valid_tab_id};
-use crate::util::{Error, FileLock, Result, exit, fmt_g, hex, is_socket, py_repr, random_bytes, unlink_missing_ok, which, write_private};
+use crate::util::{Error, FileLock, Result, mkdir_private, exit, fmt_g, hex, is_socket, py_repr, random_bytes, unlink_missing_ok, which, write_private};
 use crate::{bail, json};
 
 /// How often a foreground `show` checks the tab (URL, still open).
@@ -45,6 +45,11 @@ const WINDOW_WAIT_STEP: f64 = 0.05;
 /// calling it still shown: SETTLE_TRIES pauses of SETTLE_STEP (~2 s).
 const SETTLE_TRIES: usize = 20;
 const SETTLE_STEP: f64 = 0.1;
+/// While the event stream is broken but wayvnc seems to run: how often the
+/// viewer unit's state is checked (backing off from TAB_POLL to this) and
+/// the stream reopened (at most every STREAM_REOPEN seconds).
+const STREAM_BACKOFF_MAX: f64 = 5.0;
+const STREAM_REOPEN: f64 = 2.0;
 /// A tab poll that keeps timing out is "browser busy" until it has failed
 /// this long (seconds); then the tab is looked up afresh.
 const STALL_RECHECK: f64 = 5.0;
@@ -76,12 +81,7 @@ fn unix_now() -> f64 {
 
 /// Create the 0700 vnc/ dir in the runtime dir.
 fn ensure_vnc_dir(ctx: &Ctx) -> Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    match std::fs::DirBuilder::new().mode(0o700).create(ctx.vnc_dir()) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) => Err(e.into()),
-    }
+    mkdir_private(&ctx.vnc_dir())
 }
 
 /// Exclusive per-output lock (`vnc/HEADLESS-N.lock`), held while a `show`
@@ -208,8 +208,10 @@ pub trait VncEvents {
     fn next(&mut self, timeout: f64) -> VncEvent;
 }
 
-/// `wayvncctl -S CTL -w -j event-receive`, read without blocking past the
-/// timeout. Ends (Closed) when wayvnc exits.
+/// `wayvncctl -S CTL [-w] -j event-receive`, read without blocking past the
+/// timeout. Ends (Closed) when wayvnc exits; without -w (`wait` false) it
+/// ends at once if wayvnc isn't there (~2 ms), so a reopened stream can't
+/// hide an exit.
 struct WayvncEvents {
     child: Child,
     out: ChildStdout,
@@ -217,10 +219,16 @@ struct WayvncEvents {
     eof: bool,
 }
 
-pub fn vnc_events_real(ctx: &Ctx, ctl: &Path) -> Result<Box<dyn VncEvents>> {
+pub fn vnc_events_real(ctx: &Ctx, ctl: &Path, wait: bool) -> Result<Box<dyn VncEvents>> {
     let tool = which("wayvncctl", &ctx.env).ok_or_else(|| Error::new("wayvncctl not found (installed with wayvnc)"))?;
+    let ctl = ctl.to_string_lossy().into_owned();
+    let mut args = vec!["-S", ctl.as_str()];
+    if wait {
+        args.push("-w");
+    }
+    args.extend(["-j", "event-receive"]);
     let mut child = Command::new(tool)
-        .args(["-S", &ctl.to_string_lossy(), "-w", "-j", "event-receive"])
+        .args(&args)
         .env_clear()
         .env("PATH", ctx.env.get("PATH").unwrap_or("/usr/bin"))
         .stdin(Stdio::null())
@@ -417,7 +425,7 @@ pub fn cmd_tab_show(ctx: &Ctx, o: &TabOpts, tab: &str, s: &ShowOpts) -> Result<i
     if !foreground {
         return Ok(0);
     }
-    let events = ctx.sys.vnc_events(ctx, &viewer_control(ctx, &output))?;
+    let events = ctx.sys.vnc_events(ctx, &viewer_control(ctx, &output), true)?;
     // --wait-viewer alone follows the viewer, so its wait ends when the
     // viewer expires at the latest. --until-* watch the tab past the viewer
     // (`follow`), so on someone else's viewer they wait our own --timeout.
@@ -537,6 +545,12 @@ fn follow(
     // The viewer has exited; only the tab is watched (until mode).
     let mut viewer_gone = false;
     let mut next_poll = Instant::now();
+    // A broken event stream (wayvncctl ended while wayvnc may still run):
+    // when to look at the unit again, how long to back off, when the
+    // stream may be reopened.
+    let mut next_check = Instant::now();
+    let mut backoff = TAB_POLL;
+    let mut reopen_at = Instant::now();
     // The view ends: stop our viewer, then say whether the tab is still
     // shown (someone else's viewer, or ours could not be stopped). After a
     // disconnect or stop the viewer is exiting: give it a moment first.
@@ -626,19 +640,24 @@ fn follow(
             continue;
         }
         match events.next(left.min(TAB_POLL)) {
-            VncEvent::Idle => {}
+            VncEvent::Idle => backoff = TAB_POLL,
             VncEvent::Closed => {
                 // wayvnc exited: its last viewer left (--exit-on-disconnect),
-                // `tab unshow`, or its own timer at the deadline.
+                // `tab unshow`, or its own timer at the deadline. Or only
+                // wayvncctl ended (below).
                 if timed_out() {
                     return end("timeout", exit::TIMEOUT);
                 }
+                let now = Instant::now();
+                if now < next_check {
+                    // Backing off: keep the tab polls going meanwhile.
+                    ctx.sys.sleep(left.min(TAB_POLL).min((next_check - now).as_secs_f64()));
+                    continue;
+                }
                 // Stopped only if systemd says so: an unknown state (systemctl
-                // failing) is re-checked each poll until the deadline.
-                let stopped = matches!(
-                    ctx.sys.unit_active_state(ctx, v.unit).as_deref(),
-                    Some("deactivating" | "inactive" | "failed")
-                );
+                // failing) is looked at again later, until the deadline.
+                let state = ctx.sys.unit_active_state(ctx, v.unit);
+                let stopped = matches!(state.as_deref(), Some("deactivating" | "inactive" | "failed"));
                 if seen_viewer || stopped {
                     if until {
                         // Nobody can see the tab any more, but the condition
@@ -650,10 +669,22 @@ fn follow(
                     return end(if seen_viewer { "disconnected" } else { "stopped" }, 0);
                 }
                 // The event stream broke but wayvnc runs (or its state can't
-                // be read yet): keep the deadline, look again shortly.
-                ctx.sys.sleep(TAB_POLL);
+                // be read yet). Usually wayvncctl just saw the exit before
+                // systemd did, and the next look settles it; if wayvncctl
+                // itself died, reopen the stream (without -w: it ends at once
+                // if wayvnc is gone) so later viewer events are seen.
+                // Back off the state checks meanwhile.
+                next_check = Instant::now() + Duration::from_secs_f64(backoff);
+                backoff = (backoff * 2.0).min(STREAM_BACKOFF_MAX);
+                if state.as_deref() == Some("active") && Instant::now() >= reopen_at {
+                    reopen_at = Instant::now() + Duration::from_secs_f64(STREAM_REOPEN);
+                    if let Ok(fresh) = ctx.sys.vnc_events(ctx, &viewer_control(ctx, v.output), false) {
+                        events = fresh;
+                    }
+                }
             }
             VncEvent::Event(ev) => {
+                backoff = TAB_POLL;
                 let clients = ev["params"]["connection_count"].clone();
                 match ev["method"].as_str() {
                     Some("client-connected") => {

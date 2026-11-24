@@ -729,14 +729,7 @@ pub fn create_tab_window(ctx: &Ctx, cdp: &mut dyn CdpConn) -> Result<(String, Op
             output = Some(name.clone());
             // Mark it at once, so it's cleaned up whatever happens next.
             let dir = ctx.tab_outputs_dir();
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                    Err(e) => return Err(e.into()),
-                }
-            }
+            crate::util::mkdir_private(&dir)?;
             write_private(&dir.join(&name), "pending")?;
             // Runtime outputs start at wlroots' default size; match the
             // main output so tab viewports follow `start --size`.
