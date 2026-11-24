@@ -193,6 +193,15 @@ impl Sys for FakeSys {
             let mut n = self.run_still_loaded.borrow_mut();
             if *n > 0 {
                 *n -= 1;
+                // The old unit is still loaded because its ExecStopPost
+                // (`rm -f sock ctl state`) is running: it removes this
+                // output's files, including any state written already.
+                if let Some(i) = argv.iter().position(|a| a == "--unix-socket") {
+                    let sock = Path::new(&argv[i + 1]);
+                    for ext in ["sock", "ctl", "json"] {
+                        let _ = std::fs::remove_file(sock.with_extension(ext));
+                    }
+                }
                 return Err(Error::new(format!(
                     "systemd-run --user --quiet --collect --unit={unit} ...: Failed to start transient service unit: Unit {unit}.service was already loaded or has a fragment file."
                 )));

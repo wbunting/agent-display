@@ -614,3 +614,54 @@ fn failed_start_leaves_no_state_behind() {
     assert!(!f.t.rt.join("agent-display/vnc/HEADLESS-2.json").exists());
     assert!(!f.t.rt.join("agent-display/vnc/HEADLESS-2.sock").exists());
 }
+
+// ------------------------------------------------------------ round 4
+
+/// vnc units: inactive for the first `n` state checks (the old viewer is
+/// stopping), active after (ours runs).
+fn vnc_active_after(f: &mut Fx, n: usize) {
+    let checks = std::rc::Rc::new(std::cell::Cell::new(0));
+    f.sys.active_fn = Some(Box::new(move |u| {
+        if !u.starts_with("agent-display-vnc-") {
+            return true;
+        }
+        checks.set(checks.get() + 1);
+        checks.get() > n
+    }));
+    f.sys.active = None;
+}
+
+#[test]
+fn reshow_during_the_old_units_stop_keeps_the_new_state_and_token() {
+    // The old viewer's ExecStopPost removes the state the new show wrote
+    // before its retry: the state (and token) must still be there after.
+    let mut f = fx();
+    let (tab, _) = opened(&f);
+    *f.sys.run_still_loaded.borrow_mut() = 1;
+    vnc_active_after(&mut f, 2); // show's check, start_wayvnc's check after the refusal
+    let (code, out, err) = f.cli(&["show", &tab]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(lines(&out)[0]["already_shown"], false);
+    let st: Value =
+        serde_json::from_str(&std::fs::read_to_string(f.t.rt.join("agent-display/vnc/HEADLESS-2.json")).unwrap()).unwrap();
+    assert_eq!(st["view_only"], false);
+    assert_eq!(st["token"].as_str().unwrap().len(), 16);
+    // Another show finds its options (no "unknown options" refusal).
+    let (code, out, err) = f.cli(&["show", &tab]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(lines(&out)[0]["already_shown"], true);
+}
+
+#[test]
+fn starter_stops_its_viewer_after_a_reshow_during_the_old_units_stop() {
+    let mut f = fx();
+    let (tab, _) = opened(&f);
+    *f.sys.run_still_loaded.borrow_mut() = 1;
+    vnc_active_after(&mut f, 2);
+    let (code, out, err) = f.cli(&["show", "--wait-viewer", "--timeout", "0.05", &tab]);
+    assert_eq!(code, 3, "{err}");
+    assert_eq!(lines(&out).last().unwrap(), &json!({"unshown": tab, "reason": "timeout"}));
+    // One stop to wait out the old unit, one by end() for our own viewer.
+    assert_eq!(stopped(&f), vec!["agent-display-vnc-headless-2", "agent-display-vnc-headless-2"]);
+    assert!(!f.t.rt.join("agent-display/vnc/HEADLESS-2.json").exists());
+}

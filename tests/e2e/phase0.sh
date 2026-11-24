@@ -285,11 +285,27 @@ wait "$SP"; src=$?
 cat "$E2E_OUT/show6.jsonl"; echo "[first waiter exit $src]"
 check "first waiter timed out (3)" test "$src" -eq 3
 check "the new viewer is still running" test "$(active_viewers)" -eq 1 -a -S "$SOCK"
+check "the new viewer recorded a token" test "${#NEWTOKEN}" -eq 16
 check "and still the new one (same token)" test "$(jq -r .token "$E2E_ROOT/run/agent-display/vnc/$AO.json" 2>/dev/null)" = "$NEWTOKEN"
 run timeout 30 python3 -I "$HERE/rfb.py" "unix:$SOCK" "$E2E_OUT/show6b-frame.png" --hold 0.3
 check "a human can still connect to it" test "$rc" -eq 0
 sleep 1
 check "and it exits after that human leaves" test "$(active_viewers)" -eq 0
+
+echo "-- re-show the instant a viewer's client leaves (old unit still stopping), x5"
+ok=0
+for i in 1 2 3 4 5; do
+    ad tab show "$A" --timeout 60 >/dev/null || continue
+    timeout 30 python3 -I "$HERE/rfb.py" "unix:$SOCK" "$E2E_OUT/reshow-$i.png" --hold 0.2 >/dev/null 2>&1
+    j=$(ad tab show "$A" --timeout 60) || { echo "re-show $i failed: $j"; continue; }
+    t=$(jq -r .token "$E2E_ROOT/run/agent-display/vnc/$AO.json" 2>/dev/null)
+    k=$(ad tab show "$A") || { echo "show after re-show $i failed: $k"; continue; }
+    u=$(ad tab unshow "$A")
+    echo "round $i: re-show already_shown=$(jq .already_shown <<<"$j") token=${t:-MISSING} again already_shown=$(jq .already_shown <<<"$k") unshow was_shown=$(jq .was_shown <<<"$u")"
+    [ "${#t}" -eq 16 ] && [ "$(jq .already_shown <<<"$k")" = true ] && [ "$(jq .was_shown <<<"$u")" = true ] && ok=$((ok + 1))
+done
+check "re-show right after a disconnect keeps its state and token, can be reused and stopped (5/5: $ok)" test "$ok" -eq 5
+check "no viewer left after the re-show rounds" test "$(active_viewers)" -eq 0
 
 echo "-- two concurrent shows of one tab: one viewer, both see its options"
 ad tab show "$A" > "$E2E_OUT/c1.json" 2>&1 & C1=$!
