@@ -779,3 +779,123 @@ fn viewer_stops_happen_under_the_viewer_lock() {
     let seen = f.sys.stop_lock_seen.borrow().clone();
     assert!(seen.len() >= 2 && seen.iter().all(|h| *h), "{seen:?}");
 }
+
+// ------------------------------------------------------------ browser gone mid-view
+// The poll connection breaks when the browser exits: the view ends at once
+// (not at --timeout), as browser-down (5), or closed (0) for --until-closed.
+
+/// After the lookup's getTargetInfo, the browser exits: later polls on the
+/// old connection fail like a closed WebSocket.
+fn browser_exits_after_lookup(f: &Fx) {
+    let b = f.b.clone();
+    let mut n = 0;
+    f.b.set_hook(move |m, _| {
+        if m == "Target.getTargetInfo" {
+            n += 1;
+            if n > 1 {
+                b.st().down = true;
+                return Hook::Return(Err(Error::new("CDP closed the connection")));
+            }
+        }
+        Hook::Pass
+    });
+}
+
+#[test]
+fn until_url_ends_with_browser_down_when_the_browser_exits() {
+    let f = fx();
+    let (tab, _) = opened(&f);
+    browser_exits_after_lookup(&f);
+    // `browser stop`'s gc stopped the viewer too.
+    f.sys.vnc_script.borrow_mut().extend([ev("client-connected", 1), ev("client-disconnected", 0), VncEvent::Closed]);
+    let t0 = std::time::Instant::now();
+    let (code, out, err) = f.cli(&["show", "--until-url", "/home", "--timeout", "30", &tab]);
+    assert_eq!(code, 5, "{err}");
+    assert_eq!(lines(&out).last().unwrap(), &json!({"unshown": tab, "reason": "browser-down"}));
+    assert!(t0.elapsed().as_secs_f64() < 5.0, "not at --timeout: {:?}", t0.elapsed());
+}
+
+#[test]
+fn until_closed_ends_closed_when_the_browser_exits() {
+    let f = fx();
+    let (tab, _) = opened(&f);
+    browser_exits_after_lookup(&f);
+    f.sys.vnc_script.borrow_mut().extend([ev("client-connected", 1), ev("client-disconnected", 0), VncEvent::Closed]);
+    let t0 = std::time::Instant::now();
+    let (code, out, err) = f.cli(&["show", "--until-closed", "--timeout", "30", &tab]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(lines(&out).last().unwrap(), &json!({"unshown": tab, "reason": "closed"}));
+    assert!(t0.elapsed().as_secs_f64() < 5.0, "{:?}", t0.elapsed());
+}
+
+#[test]
+fn wait_viewer_ends_and_stops_its_viewer_when_the_browser_exits() {
+    // A crashed browser leaves the viewer up on an empty output: the view
+    // must end and stop it, not wait for the human or the timeout.
+    let f = fx();
+    let (tab, _) = opened(&f);
+    browser_exits_after_lookup(&f);
+    f.sys.vnc_script.borrow_mut().extend(std::iter::repeat_n(VncEvent::Idle, 50));
+    let (code, out, err) = f.cli(&["show", "--wait-viewer", "--timeout", "30", &tab]);
+    assert_eq!(code, 5, "{err}");
+    assert_eq!(lines(&out).last().unwrap(), &json!({"unshown": tab, "reason": "browser-down"}));
+    assert_eq!(stopped(&f), vec!["agent-display-vnc-headless-2"]);
+}
+
+#[test]
+fn broken_connection_to_a_live_tab_reconnects_and_keeps_watching() {
+    // The poll connection drops but the browser and tab are fine: look the
+    // tab up again on a new connection; the sign-in then lands (0).
+    let mut f = fx();
+    f.sys.real_sleep_cap = Some(0.01);
+    let (tab, _) = opened(&f);
+    let t2 = tab.clone();
+    let mut n = 0;
+    f.b.set_hook(move |m, _| {
+        if m == "Target.getTargetInfo" {
+            n += 1;
+            if n == 2 {
+                return Hook::Return(Err(Error::os("[Errno 32] Broken pipe")));
+            }
+            if n >= 8 {
+                return Hook::Return(Ok(json!({"targetInfo": {"targetId": t2, "type": "page",
+                    "url": "https://bank.example/home", "title": ""}})));
+            }
+        }
+        Hook::Pass
+    });
+    f.sys.vnc_script.borrow_mut().extend([ev("client-connected", 1), ev("client-disconnected", 0), VncEvent::Closed]);
+    let before = *f.sys.version_calls.borrow();
+    let (code, out, err) = f.cli(&["show", "--until-url", "/home", "--timeout", "30", &tab]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(lines(&out).last().unwrap(), &json!({"unshown": tab, "reason": "url-matched"}));
+    // lookup + tab_alive's probe + the reconnect's lookup: 3 connections.
+    assert!(*f.sys.version_calls.borrow() - before >= 3, "reconnected");
+}
+
+#[test]
+fn stalled_polls_are_busy_not_gone() {
+    // Polls that time out on a browser that is still registered but not
+    // answering: the view keeps going (until --timeout here), never "gone".
+    let mut f = fx();
+    f.sys.real_sleep_cap = Some(0.01);
+    let (tab, _) = opened(&f);
+    let mut n = 0;
+    f.b.set_hook(move |m, _| {
+        if m == "Target.getTargetInfo" {
+            n += 1;
+            if n > 1 {
+                return Hook::Return(Err(Error::new("timed out waiting for Target.getTargetInfo")));
+            }
+        }
+        Hook::Pass
+    });
+    f.sys.vnc_script.borrow_mut().extend([ev("client-connected", 1), ev("client-disconnected", 0), VncEvent::Closed]);
+    let before = *f.sys.version_calls.borrow();
+    let (code, out, err) = f.cli(&["show", "--until-url", "/home", "--timeout", "1.5", &tab]);
+    assert_eq!(code, 3, "{err}");
+    assert_eq!(lines(&out).last().unwrap(), &json!({"unshown": tab, "reason": "timeout"}));
+    // Within STALL_RECHECK a timeout is just busy: no fresh lookups, only
+    // the one connection the show's own lookup made.
+    assert_eq!(*f.sys.version_calls.borrow() - before, 1);
+}

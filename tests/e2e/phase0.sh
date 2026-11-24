@@ -412,11 +412,41 @@ check "closed tab: tab close exits 4" test "$rc" -eq 4
 
 echo
 echo "== 7. browser down: browser stop, then lookups say 5"
+# A view waiting on a sign-in when its browser is stopped: it ends at once
+# with browser-down (5), not at its --timeout.
+ad tab show "$B" --until-url '/home\.html' --timeout 120 > "$E2E_OUT/show-bstop.jsonl" 2> "$E2E_OUT/show-bstop.err" &
+SP=$!
+for _ in $(seq 50); do [ -s "$E2E_OUT/show-bstop.jsonl" ] && break; sleep 0.1; done
+s=$SECONDS
 run ad browser stop "$BUNIT"
+wait "$SP"; src=$?; el=$((SECONDS - s))
+cat "$E2E_OUT/show-bstop.jsonl" | cut -c1-140; cat "$E2E_OUT/show-bstop.err"; echo "[show exit $src, ${el} s after browser stop]"
+check "show --until-url ends when its browser is stopped: exit 5, browser-down (${el} s, --timeout 120)" \
+    bash -c "test $src -eq 5 && test $el -le 20 && grep -q '\"reason\": \"browser-down\"' '$E2E_OUT/show-bstop.jsonl'"
+check "its viewer is gone" test "$(active_viewers)" -eq 0
 run ad tab info "$B"
 check "tab of a stopped browser: exit 5" test "$rc" -eq 5
 run ad tab open --port "$P"
 check "tab open on the stopped browser's port: exit 5" test "$rc" -eq 5
+
+echo
+echo "== 8. browser crash (SIGKILL) during tab show --wait-viewer"
+BJ2=$(ad browser start --temp); echo "$BJ2"
+P2=$(jq -r .port <<<"$BJ2"); BUNIT2=$(jq -r .unit <<<"$BJ2"); PROFILE2=$(jq -r .profile <<<"$BJ2")
+C=$(ad tab open --port "$P2" "http://127.0.0.1:$HP/" | jq -r .tab)
+ad tab show "$C" --wait-viewer --timeout 120 > "$E2E_OUT/show-crash.jsonl" 2> "$E2E_OUT/show-crash.err" &
+SP=$!
+for _ in $(seq 50); do [ -s "$E2E_OUT/show-crash.jsonl" ] && break; sleep 0.1; done
+check "viewer up before the crash" test "$(active_viewers)" -eq 1
+s=$SECONDS
+kill -KILL "$(nsys show -p MainPID --value "$BUNIT2.service")"
+wait "$SP"; src=$?; el=$((SECONDS - s))
+cat "$E2E_OUT/show-crash.jsonl" | cut -c1-140; cat "$E2E_OUT/show-crash.err"; echo "[show exit $src, ${el} s after the crash]"
+check "show --wait-viewer ends when its browser crashes: exit 5, browser-down (${el} s, --timeout 120)" \
+    bash -c "test $src -eq 5 && test $el -le 20 && grep -q '\"reason\": \"browser-down\"' '$E2E_OUT/show-crash.jsonl'"
+check "and stopped its viewer (no human needed)" test "$(active_viewers)" -eq 0
+for _ in $(seq 50); do [ -e "$PROFILE2" ] || break; sleep 0.1; done
+check "the crashed temp browser's profile is gone" test ! -e "$PROFILE2"
 
 echo
 echo "== teardown"

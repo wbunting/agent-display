@@ -268,6 +268,9 @@ impl Sys for FakeSys {
         Ok(())
     }
     fn browsers(&self, ctx: &Ctx) -> Vec<BrowserInfo> {
+        if self.browser.as_ref().is_some_and(|b| b.st().down) {
+            return vec![]; // its registration went with it
+        }
         match &*self.browsers.borrow() {
             Some(b) => b.clone(),
             None => crate::browser::browsers_real(ctx),
@@ -326,7 +329,7 @@ impl Sys for FakeSys {
         // Like Cdp::connect: /json/version first (where stalls show up).
         self.cdp_version(port, timeout)?;
         let b = self.browser.clone().ok_or_else(|| Error::os("[Errno 111] Connection refused"))?;
-        if b.st().fail_connect {
+        if b.st().fail_connect || b.st().down {
             return Err(Error::os("[Errno 111] Connection refused"));
         }
         Ok(Box::new(FakeConn { b, port, default: timeout }))
@@ -392,6 +395,8 @@ pub struct BrowserState {
     pub hook: Option<HookFn>,
     pub sway: Option<FakeSway>,
     pub fail_connect: bool,
+    /// The browser has exited: no longer registered, connections refused.
+    pub down: bool,
 }
 
 #[derive(Clone)]
@@ -412,6 +417,7 @@ impl FakeBrowser {
             hook: None,
             sway: None,
             fail_connect: false,
+            down: false,
         })))
     }
 

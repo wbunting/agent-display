@@ -112,8 +112,12 @@ sequence of blocking request/response steps with deadlines.
    lines and ending the view on the condition (the URL is never printed).
    With `--until-*`, exit 0 means the condition was met: if the human
    leaves first (`{"viewer": "stopped"}`), the tab is still watched until
-   the condition, `--timeout` (3) or the tab going away (4), since a
-   sign-in can finish on the human's phone after they close the viewer.
+   the condition, `--timeout` (3) or the tab going away (4; 5 if its whole
+   browser went away), since a sign-in can finish on the human's phone
+   after they close the viewer. A poll that fails on a broken connection
+   (browser exited or restarted) looks the tab up afresh at once, and
+   reconnects if it is still there; a stalled browser counts as busy for
+   5 s first. With `--until-closed`, the tab going away is "closed" (0).
    `--wait-viewer` alone ends (0) when the viewer disconnects.
    `tab close` and the output gc stop a tab's viewer. `view` gained
    `--exit-on-disconnect`.

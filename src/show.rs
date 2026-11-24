@@ -27,12 +27,15 @@ use serde_json::{Map, Value, json};
 use crate::cli::{ShowOpts, TabOpts};
 use crate::ctx::*;
 use crate::display::{Wayvnc, display, start_wayvnc, wayvnc_argv};
-use crate::tab::{GONE_RECHECK, lookup, marked_outputs, no_such_target, output_windows, tab_alive, valid_tab_id};
+use crate::tab::{Found, GONE_RECHECK, lookup, marked_outputs, no_such_target, output_windows, owned_ports, tab_alive, valid_tab_id};
 use crate::util::{Error, FileLock, Result, exit, fmt_g, hex, is_socket, py_repr, random_bytes, unlink_missing_ok, which, write_private};
 use crate::{bail, json};
 
 /// How often a foreground `show` checks the tab (URL, still open).
 const TAB_POLL: f64 = 0.5;
+/// A tab poll that keeps timing out is "browser busy" until it has failed
+/// this long (seconds); then the tab is looked up afresh.
+const STALL_RECHECK: f64 = 5.0;
 /// wayvnc's own kill timer runs this much past the view's deadline, so a
 /// foreground `show` always reaches its deadline (exit 3) first.
 pub const VIEWER_GRACE: f64 = 2.0;
@@ -287,7 +290,7 @@ pub fn cmd_tab_show(ctx: &Ctx, o: &TabOpts, tab: &str, s: &ShowOpts) -> Result<i
     let disp = display(ctx)?;
     let timeout_bin = tool(ctx, "timeout")?;
     tool(ctx, "wayvnc")?;
-    let mut found = lookup(ctx, tab, o.port_raw)?;
+    let found = lookup(ctx, tab, o.port_raw)?;
     let Some(output) = tab_output(ctx, tab) else {
         bail!("tab {tab} has no output of its own (opened before outputs existed, or sway couldn't add one); open a new tab with `tab open` and show that");
     };
@@ -342,7 +345,7 @@ pub fn cmd_tab_show(ctx: &Ctx, o: &TabOpts, tab: &str, s: &ShowOpts) -> Result<i
     let wait = if until && token.is_none() { s.timeout } else { left.min(s.timeout) };
     let deadline = Instant::now() + Duration::from_secs_f64(wait);
     let view = View { tab, output: &output, unit: &unit, token, deadline };
-    follow(ctx, &view, s, until_url.as_ref(), events, found.cdp.as_mut())
+    follow(ctx, &view, s, until_url.as_ref(), events, found, o.port_raw)
 }
 
 /// Start a viewer for `output`; returns its token (see the module doc).
@@ -416,17 +419,27 @@ impl View<'_> {
 /// With --until-url / --until-closed the condition decides: exit 0 only
 /// when it is met. The viewer may go first (the human disconnects, `tab
 /// unshow`); the tab is then still watched until the condition, --timeout
-/// (3) or the tab going away (4), because a sign-in often finishes after
-/// the human has left (phone approval, an emailed link). Only
-/// --wait-viewer alone ends with the viewer (0).
+/// (3) or the tab going away (4, or 5 if its whole browser went away),
+/// because a sign-in often finishes after the human has left (phone
+/// approval, an emailed link). Only --wait-viewer alone ends with the
+/// viewer (0). --until-closed ends with "closed" (0) however the tab went.
+///
+/// The tab is polled on the connection `lookup` opened. A poll that fails
+/// with a broken connection (browser exited or restarted) makes it look the
+/// tab up afresh at once; one that keeps timing out (a stalled browser) does
+/// after STALL_RECHECK. Gone ends the view; alive reconnects.
 fn follow(
     ctx: &Ctx,
     v: &View,
     s: &ShowOpts,
     until_url: Option<&regex_lite::Regex>,
     mut events: Box<dyn VncEvents>,
-    cdp: &mut dyn crate::cdp::CdpConn,
+    found: Found,
+    port_arg: Option<i64>,
 ) -> Result<i32> {
+    let Found { mut port, mut cdp, .. } = found;
+    // When polls started failing (None while they answer).
+    let mut failing_since: Option<Instant> = None;
     let tab = v.tab;
     let until = until_url.is_some() || s.until_closed;
     let mut seen_viewer = false;
@@ -437,6 +450,17 @@ fn follow(
         v.stop_own(ctx);
         emit(ctx, vec![("unshown", tab.into()), ("reason", reason.into())]);
         Ok(code)
+    };
+    // The tab is gone for good: why, and how this view ends.
+    let gone = |port: u16| -> Result<i32> {
+        let browser_down = !owned_ports(ctx).iter().any(|(p, _)| *p == port as i64);
+        if s.until_closed {
+            end("closed", 0)
+        } else if browser_down {
+            end("browser-down", exit::BROWSER_DOWN)
+        } else {
+            end("tab-gone", exit::GONE)
+        }
     };
     // wayvnc's own timer ends VIEWER_GRACE after the deadline; an end
     // this close to the deadline is the timeout.
@@ -450,6 +474,7 @@ fn follow(
             next_poll = Instant::now() + Duration::from_secs_f64(TAB_POLL);
             match cdp.call("Target.getTargetInfo", json!({"targetId": tab}), None, Some(5.0)) {
                 Ok(r) => {
+                    failing_since = None;
                     let url = r["targetInfo"]["url"].as_str().unwrap_or("");
                     // Never print the URL: after a sign-in it can hold codes.
                     if until_url.is_some_and(|re| re.is_match(url)) {
@@ -459,11 +484,33 @@ fn follow(
                 Err(e) if no_such_target(&e) => {
                     ctx.sys.sleep(GONE_RECHECK);
                     if tab_alive(ctx, tab) == Some(false) {
-                        return if s.until_closed { end("closed", 0) } else { end("tab-gone", exit::GONE) };
+                        return gone(port);
                     }
                 }
-                // A busy browser: keep showing, check again later.
-                Err(_) => {}
+                Err(e) => {
+                    // A timeout is a busy browser until it has lasted
+                    // STALL_RECHECK; a broken connection never gets better.
+                    let broken = !e.is_timeout();
+                    let since = *failing_since.get_or_insert_with(Instant::now);
+                    if broken || since.elapsed().as_secs_f64() >= STALL_RECHECK {
+                        failing_since = Some(Instant::now());
+                        match tab_alive(ctx, tab) {
+                            Some(false) => return gone(port),
+                            // Alive: poll it on a fresh connection.
+                            Some(true) if broken => match lookup(ctx, tab, port_arg) {
+                                Ok(f) => {
+                                    port = f.port;
+                                    cdp = f.cdp;
+                                    failing_since = None;
+                                }
+                                Err(e) if e.code == exit::GONE || e.code == exit::BROWSER_DOWN => return gone(port),
+                                Err(_) => {}
+                            },
+                            // Still busy (or unknown): keep showing.
+                            _ => {}
+                        }
+                    }
+                }
             }
         }
         if viewer_gone {
