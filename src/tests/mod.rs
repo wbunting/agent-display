@@ -3,6 +3,7 @@
 //! in README.md (Verification) and isolation_check.mjs.
 
 mod fakes;
+mod input_tests;
 mod show_tests;
 mod tab_tests;
 mod wait_tests;
@@ -219,7 +220,7 @@ fn chromium_flags() {
     let t = TempHome::new();
     let sys = FakeSys::default();
     let ctx = t.ctx(&sys);
-    let argv = chromium_argv(&ctx, Path::new("/p"), 9425, &[], &[]);
+    let argv = chromium_argv(&ctx, Path::new("/p"), 9425, &[]);
     // Not the /usr/bin wrapper: it appends ~/.config/chromium-flags.conf.
     assert_eq!(argv[0], "/usr/lib/chromium/chromium");
     for flag in ["--ozone-platform=wayland", "--user-data-dir=/p", "--remote-debugging-port=9425", "--no-first-run", "--password-store=basic"] {
@@ -365,7 +366,7 @@ fn dependents_bind_to_display() {
     let sys = FakeSys::default();
     let ctx = t.ctx(&sys);
     let post: Vec<String> = ["/usr/bin/rm", "-rf", "--", "/var/tmp/x"].map(String::from).to_vec();
-    systemd::systemd_run(&ctx, "agent-display-browser", &["/bin/true".into()], true, Some(&post), None).unwrap();
+    systemd::systemd_run(&ctx, "agent-display-browser", &["/bin/true".into()], true, Some(&post), None, &[]).unwrap();
     let argv = sys.runs.borrow()[0].0.clone();
     assert!(argv.contains(&"BindsTo=agent-display.service".to_string()));
     assert!(argv.contains(&"ExecStopPost=/usr/bin/rm -rf -- /var/tmp/x".to_string()));
@@ -398,6 +399,107 @@ fn temp_profile_removed_when_port_reserved() {
     assert!(sys.systemd_runs.borrow().is_empty());
     let made = sys.made.borrow();
     assert!(made[0].starts_with("/var/tmp") && !made[0].exists());
+}
+
+/// A persistent `browser start` that comes up: (sys, browser).
+fn started_browser(t: &TempHome, stdin: Option<&[u8]>, urls: &[&str]) -> (FakeSys, FakeBrowser, String) {
+    let b = FakeBrowser::new();
+    b.st().targets.push(("BLANK00000000001".into(), json!({"type": "page", "url": "about:blank", "title": ""})));
+    let sys = FakeSys {
+        display: Some(Ok(disp())),
+        port_free: Some(true),
+        active: Some(true),
+        listener: Some(Box::new(|_, _| true)),
+        browser: Some(b.clone()),
+        ..Default::default()
+    };
+    sys.active_seq.borrow_mut().push_back(false); // not running yet
+    *sys.stdin.borrow_mut() = stdin.map(|s| s.to_vec());
+    let err = Buf::default();
+    let mut ctx = Ctx::new(t.env(), &sys, Box::new(std::io::sink()), Box::new(err.clone()));
+    ctx.env.0.push(("AGENT_DISPLAY_CHROMIUM".into(), "/bin/true".into()));
+    ensure_runtime_dir(&ctx).unwrap();
+    let urls: Vec<String> = urls.iter().map(|u| u.to_string()).collect();
+    assert_eq!(browser::cmd_browser_start(&ctx, false, Some(9431), false, &urls).unwrap(), 0);
+    drop(ctx);
+    (sys, b, err.text())
+}
+
+#[test]
+fn browser_start_keeps_urls_out_of_execstart_and_disables_core_dumps() {
+    let t = TempHome::new();
+    let url = "https://bank.example/approve?token=SECRET-ONE-TIME";
+    let (sys, b, err) = started_browser(&t, None, &[url, "https://second.example/"]);
+    assert_eq!(err, "");
+    let runs = sys.systemd_runs.borrow();
+    let argv = &runs[0];
+    assert_eq!(argv.last().unwrap(), "about:blank");
+    assert!(!argv.iter().any(|a| a.contains("bank.example") || a.contains("second.example")), "{argv:?}");
+    assert_eq!(sys.systemd_props.borrow()[0], vec!["LimitCORE=0".to_string()]);
+    // Opened over CDP instead: the first in the about:blank tab, the rest new.
+    let calls = b.st().calls.clone();
+    let nav = calls.iter().find(|c| c.0 == "Page.navigate").unwrap();
+    assert_eq!((nav.1["url"].as_str(), nav.2.as_deref()), (Some(url), Some("S-BLANK00000000001")));
+    let created: Vec<&str> = calls.iter().filter(|c| c.0 == "Target.createTarget").map(|c| c.1["url"].as_str().unwrap()).collect();
+    assert_eq!(created, vec!["https://second.example/"]);
+}
+
+#[test]
+fn systemd_run_passes_extra_properties() {
+    let t = TempHome::new();
+    let sys = FakeSys::default();
+    let ctx = t.ctx(&sys);
+    systemd::systemd_run(&ctx, "agent-display-browser", &["/bin/true".into()], true, None, None, &["LimitCORE=0"]).unwrap();
+    let argv = &sys.runs.borrow()[0].0;
+    let i = argv.iter().position(|a| a == "LimitCORE=0").unwrap();
+    assert_eq!(argv[i - 1], "-p");
+    assert!(i < argv.iter().position(|a| a == "--").unwrap());
+}
+
+#[test]
+fn browser_start_urls_from_stdin() {
+    let t = TempHome::new();
+    let (sys, b, _) = started_browser(&t, Some(b"https://a.example/?code=XYZ\n\nhttps://b.example/\n"), &["-"]);
+    assert!(!sys.systemd_runs.borrow()[0].iter().any(|a| a.contains("example")));
+    let calls = b.st().calls.clone();
+    assert_eq!(calls.iter().find(|c| c.0 == "Page.navigate").unwrap().1["url"], "https://a.example/?code=XYZ");
+    assert_eq!(calls.iter().filter(|c| c.0 == "Target.createTarget").count(), 1);
+}
+
+#[test]
+fn browser_start_writes_no_password_manager_prefs() {
+    let t = TempHome::new();
+    // An existing profile keeps its other preferences.
+    let prefs = t.home.join(".local/state/agent-display/browser-profile/Default/Preferences");
+    std::fs::create_dir_all(prefs.parent().unwrap()).unwrap();
+    std::fs::write(&prefs, r#"{"profile":{"name":"Agent","password_manager_enabled":true},"credentials_enable_service":true,"x":1}"#).unwrap();
+    started_browser(&t, None, &[]);
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&prefs).unwrap()).unwrap();
+    assert_eq!(v["x"], 1);
+    assert_eq!(v["profile"]["name"], "Agent");
+    for (key, want) in browser::PROFILE_PREFS {
+        let got = key.split('.').fold(&v, |n, k| &n[k]);
+        assert_eq!(got, &json!(want), "{key}");
+    }
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(std::fs::metadata(&prefs).unwrap().permissions().mode() & 0o777, 0o600);
+}
+
+#[test]
+fn unreadable_prefs_are_left_alone() {
+    let t = TempHome::new();
+    let p = t.root.join("prof");
+    std::fs::create_dir_all(p.join("Default")).unwrap();
+    std::fs::write(p.join("Default/Preferences"), "not json").unwrap();
+    assert!(!browser::harden_profile_prefs(&p).unwrap());
+    assert_eq!(std::fs::read_to_string(p.join("Default/Preferences")).unwrap(), "not json");
+    // A fresh (temp) profile gets the file.
+    let q = t.root.join("fresh");
+    std::fs::create_dir_all(&q).unwrap();
+    assert!(browser::harden_profile_prefs(&q).unwrap());
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(q.join("Default/Preferences")).unwrap()).unwrap();
+    assert_eq!(v["credentials_enable_service"], false);
+    assert_eq!(v["autofill"]["profile_enabled"], false);
 }
 
 #[test]

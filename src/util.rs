@@ -35,8 +35,9 @@ pub mod exit {
     pub const GONE: i32 = 4;
     /// The browser holding the tab is not running.
     pub const BROWSER_DOWN: i32 = 5;
-    /// Reserved: read-back after an input action did not match. Not used
-    /// by any command yet.
+    /// `tab type`: the field's length afterwards doesn't match what was
+    /// typed (maxlength, an input mask); then `--submit` does not press
+    /// Enter.
     pub const MISMATCH: i32 = 6;
     /// No definitive answer (browser stalled, lookup failed after internal
     /// retries): try again later. EX_TEMPFAIL.

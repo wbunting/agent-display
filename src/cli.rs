@@ -194,7 +194,9 @@ fn build() -> Parser {
     la.pos("name", Nargs::One, Ty::Str, Val::None);
     la.pos("argv", Nargs::Remainder, Ty::Str, Val::None);
     subs.push(("launch", la));
-    subs.push(("windows", c("windows")));
+    let mut w = c("windows");
+    w.flag("--show-url", "show_url");
+    subs.push(("windows", w));
     let mut f = c("focus");
     f.pos("id", Nargs::One, Ty::Int, Val::None);
     subs.push(("focus", f));
@@ -248,10 +250,16 @@ fn build() -> Parser {
         }
         sp
     };
+    // Commands that print URLs redact them unless --show-url.
+    let show_url = |sp: &mut Parser| {
+        sp.flag("--show-url", "show_url");
+    };
     let mut to = tab_cmd(&tb, "open", false);
     to.pos("url", Nargs::Opt, Ty::Str, Val::None);
+    show_url(&mut to);
     let mut tg = tab_cmd(&tb, "goto", true);
     tg.pos("url", Nargs::One, Ty::Str, Val::None);
+    show_url(&mut tg);
     tg.flag("--wait-load", "wait_load").group = Some(1);
     tg.opt("--wait-ms", "wait_ms", Ty::Int, Val::None).group = Some(1);
     let mut te = tab_cmd(&tb, "eval", true);
@@ -259,9 +267,45 @@ fn build() -> Parser {
     let mut tsh = tab_cmd(&tb, "shot", true);
     tsh.pos("path", Nargs::One, Ty::Str, Val::None);
     tsh.flag("--full-page", "full_page");
-    let ti = tab_cmd(&tb, "info", true);
+    let mut ti = tab_cmd(&tb, "info", true);
+    show_url(&mut ti);
     let tc = tab_cmd(&tb, "close", true);
-    let tl = tab_cmd(&tb, "list", false);
+    let mut tl = tab_cmd(&tb, "list", false);
+    show_url(&mut tl);
+    let locator = |sp: &mut Parser, text: bool| {
+        sp.opt("--css", "css", Ty::Str, Val::None);
+        sp.opt("--label", "label", Ty::Str, Val::None);
+        sp.opt("--role", "role", Ty::Str, Val::None);
+        sp.opt("--name", "name", Ty::Str, Val::None);
+        if text {
+            sp.opt("--text", "text_loc", Ty::Str, Val::None);
+        }
+        sp.opt("--ref", "ref", Ty::Str, Val::None);
+        sp.flag("--focused", "focused");
+        sp.opt("--nth", "nth", Ty::Int, Val::None);
+    };
+    // type/click: --timeout is how long to wait for the element.
+    let element_timeout = |sp: &mut Parser| {
+        if let Some(a) = sp.args.iter_mut().find(|a| a.dest == "timeout") {
+            a.default = Val::Float(crate::input::ELEMENT_TIMEOUT);
+        }
+    };
+    let mut tty = tab_cmd(&tb, "type", true);
+    element_timeout(&mut tty);
+    tty.pos("text", Nargs::Opt, Ty::Str, Val::None);
+    locator(&mut tty, false);
+    tty.flag("--stdin", "stdin");
+    tty.flag("--keys", "keys");
+    tty.flag("--append", "append");
+    tty.flag("--submit", "submit");
+    tty.flag("--keep-newline", "keep_newline");
+    let mut tck = tab_cmd(&tb, "click", true);
+    element_timeout(&mut tck);
+    locator(&mut tck, true);
+    tck.opt("--count", "count", Ty::Int, Val::Int(1));
+    let mut tsn = tab_cmd(&tb, "snapshot", true);
+    tsn.flag("--all", "all");
+    show_url(&mut tsn);
     // show: --timeout is how long the view may stay up, not a CDP step.
     let mut tsw = tb.child("show");
     tsw.opt("--port", "port", Ty::Int, Val::None);
@@ -287,6 +331,7 @@ fn build() -> Parser {
     tw.opt("--stable-ms", "stable_ms", Ty::Int, Val::Int(0));
     tw.opt("--tick-ms", "tick_ms", Ty::Int, Val::Int(1000));
     tw.opt("--dialog", "dialog", Ty::Str, Val::Str("dismiss".into())).choices = choices(&["accept", "dismiss"]);
+    show_url(&mut tw);
     tb.sub(
         "tab_command",
         vec![
@@ -300,6 +345,9 @@ fn build() -> Parser {
             ("show", tsw),
             ("unshow", tus),
             ("wait", tw),
+            ("type", tty),
+            ("click", tck),
+            ("snapshot", tsn),
         ],
     );
     subs.push(("tab", tb));
@@ -772,6 +820,7 @@ pub struct TabOpts {
     pub port: Option<u16>,
     pub port_raw: Option<i64>,
     pub timeout: f64,
+    pub show_url: bool,
 }
 
 /// `tab show` options (see show.rs).
@@ -830,7 +879,7 @@ pub enum Cmd {
     Env,
     Exec { argv: Vec<String> },
     Launch { name: String, argv: Vec<String> },
-    Windows,
+    Windows { show_url: bool },
     Focus { id: i64 },
     Screenshot { path: String, window: Option<i64> },
     Type { text: String },
@@ -848,6 +897,9 @@ pub enum Cmd {
     TabInfo { o: TabOpts, tab: String },
     TabClose { o: TabOpts, tab: String },
     TabList { o: TabOpts },
+    TabType { o: TabOpts, tab: String, loc: crate::input::Locator, text: Option<String>, stdin: bool, keys: bool, append: bool, submit: bool, keep_newline: bool },
+    TabClick { o: TabOpts, tab: String, loc: crate::input::Locator, count: i64 },
+    TabSnapshot { o: TabOpts, tab: String, all: bool },
     TabShow { o: TabOpts, tab: String, show: ShowOpts },
     TabUnshow { tab: String },
     TabWait { o: TabOpts, tab: String, spec: WaitSpec },
@@ -929,6 +981,7 @@ pub fn parse(argv: &[String]) -> Result<Cmd, Exit> {
                 Some(Val::Float(f)) => *f,
                 _ => 30.0,
             },
+            show_url: b(ns, "show_url"),
         }
     };
     let cmd = match s(&ns, "command").as_str() {
@@ -939,7 +992,7 @@ pub fn parse(argv: &[String]) -> Result<Cmd, Exit> {
         "env" => Cmd::Env,
         "exec" => Cmd::Exec { argv: list(&ns, "argv") },
         "launch" => Cmd::Launch { name: s(&ns, "name"), argv: list(&ns, "argv") },
-        "windows" => Cmd::Windows,
+        "windows" => Cmd::Windows { show_url: b(&ns, "show_url") },
         "focus" => Cmd::Focus { id: i(&ns, "id").unwrap_or(0) },
         "screenshot" => Cmd::Screenshot { path: s(&ns, "path"), window: i(&ns, "window") },
         "type" => Cmd::Type { text: s(&ns, "text") },
@@ -975,6 +1028,47 @@ pub fn parse(argv: &[String]) -> Result<Cmd, Exit> {
                 "shot" => Cmd::TabShot { o, tab: s(&ns, "tab"), path: s(&ns, "path"), full_page: b(&ns, "full_page") },
                 "info" => Cmd::TabInfo { o, tab: s(&ns, "tab") },
                 "close" => Cmd::TabClose { o, tab: s(&ns, "tab") },
+                cmd @ ("type" | "click") => {
+                    let loc = crate::input::Locator {
+                        css: os_(&ns, "css"),
+                        label: os_(&ns, "label"),
+                        role: os_(&ns, "role"),
+                        name: os_(&ns, "name"),
+                        text: os_(&ns, "text_loc"),
+                        r#ref: os_(&ns, "ref"),
+                        focused: b(&ns, "focused"),
+                        nth: i(&ns, "nth"),
+                    };
+                    let usage = |msg: &str| {
+                        let tab = &top.subs.iter().find(|(n, _)| *n == "tab").unwrap().1;
+                        let sub = &tab.subs.iter().find(|(n, _)| *n == cmd).unwrap().1;
+                        error(sub, msg).0
+                    };
+                    if let Some(msg) = loc.usage_error(cmd == "click") {
+                        return Err(usage(&msg));
+                    }
+                    if cmd == "type" {
+                        let text = os_(&ns, "text");
+                        let stdin = b(&ns, "stdin");
+                        match (&text, stdin) {
+                            (Some(_), true) => return Err(usage("give TEXT or --stdin, not both")),
+                            (None, false) => return Err(usage("give TEXT, or --stdin for secrets")),
+                            _ => {}
+                        }
+                        if b(&ns, "keep_newline") && !stdin {
+                            return Err(usage("--keep-newline goes with --stdin"));
+                        }
+                        Cmd::TabType { o, tab: s(&ns, "tab"), loc, text, stdin, keys: b(&ns, "keys"),
+                                       append: b(&ns, "append"), submit: b(&ns, "submit"), keep_newline: b(&ns, "keep_newline") }
+                    } else {
+                        let count = i(&ns, "count").unwrap_or(1);
+                        if !(1..=3).contains(&count) {
+                            return Err(usage("--count is 1, 2 or 3"));
+                        }
+                        Cmd::TabClick { o, tab: s(&ns, "tab"), loc, count }
+                    }
+                }
+                "snapshot" => Cmd::TabSnapshot { o, tab: s(&ns, "tab"), all: b(&ns, "all") },
                 "show" => Cmd::TabShow {
                     o,
                     tab: s(&ns, "tab"),
@@ -1042,15 +1136,99 @@ mod tests {
         e.stderr.lines().last().unwrap().to_string()
     }
     fn o() -> TabOpts {
-        TabOpts { port: None, port_raw: None, timeout: 30.0 }
+        TabOpts { port: None, port_raw: None, timeout: 30.0, show_url: false }
+    }
+
+    /// Every command and subcommand has its usage and help text (new ones
+    /// are edited by hand in src/cli_text.rs), and `-h` prints it.
+    #[test]
+    fn every_command_has_help() {
+        fn walk(p: &Parser, out: &mut Vec<String>) {
+            out.push(p.prog.clone());
+            for (_, c) in &p.subs {
+                walk(c, out);
+            }
+        }
+        let mut progs = Vec::new();
+        walk(&build(), &mut progs);
+        assert!(progs.len() > 30);
+        for prog in progs {
+            let (usage, help) = texts(&prog);
+            assert!(usage.starts_with(&format!("usage: {prog} ")), "{prog}: {usage:?}");
+            assert!(help.starts_with(usage) && help.contains("-h, --help"), "{prog}");
+            let argv: Vec<&str> = prog.split(' ').skip(1).chain(["-h"]).collect();
+            let e = p(&argv.join("|")).unwrap_err();
+            assert_eq!((e.code, e.stdout.as_str(), e.stderr.as_str()), (0, help, ""), "{prog}");
+        }
+        let (_, h) = texts("agent-display tab");
+        assert!(h.contains("{open,goto,eval,shot,info,close,list,show,unshow,wait,type,click,snapshot}"), "{h}");
+        assert!(h.contains("  6   verification mismatch (tab type: the field's length differs)\n"), "{h}");
+        for (prog, flags) in [
+            ("agent-display tab type", &["--stdin", "--label", "--keys", "--submit", "--nth", "Exit 6"][..]),
+            ("agent-display tab click", &["--text", "--role", "--name", "--count"][..]),
+            ("agent-display tab snapshot", &["--all", "--show-url", "[filled]"][..]),
+            ("agent-display tab goto", &["--show-url", "- reads it from stdin"][..]),
+            ("agent-display tab open", &["--show-url"][..]),
+            ("agent-display tab info", &["--show-url"][..]),
+            ("agent-display tab list", &["--show-url"][..]),
+            ("agent-display windows", &["--show-url", "<title>"][..]),
+        ] {
+            let (_, h) = texts(prog);
+            for f in flags {
+                assert!(h.contains(f), "{prog} help lacks {f}");
+            }
+        }
+        // Commands that never print URLs don't take --show-url.
+        assert!(!texts("agent-display tab eval").1.contains("--show-url"));
+        assert!(p("tab|eval|T|x|--show-url").is_err());
+    }
+
+    #[test]
+    fn tab_input_usage_errors_exit_2() {
+        for (argv, msg) in [
+            ("tab|type|T|x", "give exactly one of --label, --role, --css, --ref or --focused"),
+            ("tab|type|T|--label|A|--css|b|x", "give exactly one of"),
+            ("tab|type|T|--label|A", "give TEXT, or --stdin for secrets"),
+            ("tab|type|T|--label|A|x|--stdin", "give TEXT or --stdin, not both"),
+            ("tab|type|T|--label|A|x|--keep-newline", "--keep-newline goes with --stdin"),
+            ("tab|type|T|--label|A|--name|B|x", "--name needs --role"),
+            ("tab|type|T|--text|A|x", "unrecognized arguments: --text"),
+            ("tab|click|T|--role|button|--nth|0", "--nth counts from 1"),
+            ("tab|click|T|--ref|e12", "bad ref"),
+            ("tab|click|T|--focused|--nth|2", "--nth goes with"),
+            ("tab|click|T|--text|Go|--count|4", "--count is 1, 2 or 3"),
+            ("tab|click|T", "give exactly one of --label, --role, --text, --css, --ref or --focused"),
+        ] {
+            let e = p(argv).unwrap_err();
+            assert_eq!(e.code, 2, "{argv}");
+            assert!(e.stderr.contains(msg), "{argv}: {}", e.stderr);
+            // argparse reports unknown flags from the top-level parser.
+            assert!(e.stderr.starts_with("usage: agent-display "), "{argv}: {}", e.stderr);
+        }
+    }
+
+    #[test]
+    fn tab_input_commands_parse() {
+        use crate::input::Locator;
+        assert_eq!(
+            p("tab|type|T|--label|Password|--stdin|--submit").unwrap(),
+            Cmd::TabType { o: TabOpts { timeout: 10.0, ..o() }, tab: "T".into(), loc: Locator { label: Some("Password".into()), ..Default::default() },
+                           text: None, stdin: true, keys: false, append: false, submit: true, keep_newline: false }
+        );
+        assert_eq!(
+            p("tab|click|T|--role|button|--name|Sign in").unwrap(),
+            Cmd::TabClick { o: TabOpts { timeout: 10.0, ..o() }, tab: "T".into(),
+                            loc: Locator { role: Some("button".into()), name: Some("Sign in".into()), ..Default::default() }, count: 1 }
+        );
+        assert_eq!(p("tab|goto|T|-").unwrap(), Cmd::TabGoto { o: o(), tab: "T".into(), url: "-".into(), wait_ms: None });
     }
 
     #[test]
     fn options_and_positionals_intermix_like_argparse() {
         assert_eq!(p("tab|open|--port|9425|https://x").unwrap(),
-                   Cmd::TabOpen { o: TabOpts { port: Some(9425), port_raw: Some(9425), timeout: 30.0 }, url: Some("https://x".into()) });
+                   Cmd::TabOpen { o: TabOpts { port: Some(9425), port_raw: Some(9425), timeout: 30.0, show_url: false }, url: Some("https://x".into()) });
         assert_eq!(p("tab|open|https://x|--port|9425").unwrap(),
-                   Cmd::TabOpen { o: TabOpts { port: Some(9425), port_raw: Some(9425), timeout: 30.0 }, url: Some("https://x".into()) });
+                   Cmd::TabOpen { o: TabOpts { port: Some(9425), port_raw: Some(9425), timeout: 30.0, show_url: false }, url: Some("https://x".into()) });
         assert_eq!(p("tab|goto|T|--wait-ms|5|U").unwrap(),
                    Cmd::TabGoto { o: o(), tab: "T".into(), url: "U".into(), wait_ms: Some(5) });
         assert_eq!(p("tab|shot|--full|T|P").unwrap(),
@@ -1155,7 +1333,9 @@ mod tests {
             e.stdout
         };
         let tab = h("tab|-h");
-        assert!(tab.starts_with("usage: agent-display tab [-h]\n                         {open,goto,eval,shot,info,close,list,show,unshow,wait} ...\n"));
+        assert!(tab.starts_with(
+            "usage: agent-display tab [-h]\n                         {open,goto,eval,shot,info,close,list,show,unshow,wait,type,click,snapshot} ...\n"
+        ));
         assert!(tab.contains("    show                let a human see and use this tab's window over VNC\n"));
         assert!(tab.contains("  4   tab gone: closed or crashed (checked twice, ~250 ms apart)\n"));
         assert!(tab.contains("  75  no definitive answer (browser stalled or restarting): try again\n"));
@@ -1203,9 +1383,9 @@ mod tests {
 
     #[test]
     fn help_exits_zero_with_python_text() {
-        let e = p("tab|open|-h").unwrap_err();
+        let e = p("tab|eval|-h").unwrap_err();
         assert_eq!(e.code, 0);
-        assert!(e.stdout.starts_with("usage: agent-display tab open [-h] [--port PORT] [--timeout TIMEOUT] [url]\n"));
+        assert!(e.stdout.starts_with("usage: agent-display tab eval [-h] [--port PORT] [--timeout TIMEOUT] tab js\n"));
         assert!(e.stdout.contains("seconds per CDP step (default 30)"));
     }
 
@@ -1213,7 +1393,9 @@ mod tests {
     fn tab_help_lists_wait_and_wait_help_is_complete() {
         let e = p("tab|--help").unwrap_err();
         assert_eq!((e.code, e.stderr.as_str()), (0, ""));
-        assert!(e.stdout.starts_with("usage: agent-display tab [-h]\n                         {open,goto,eval,shot,info,close,list,show,unshow,wait} ...\n"));
+        assert!(e.stdout.starts_with(
+            "usage: agent-display tab [-h]\n                         {open,goto,eval,shot,info,close,list,show,unshow,wait,type,click,snapshot} ...\n"
+        ));
         assert!(e.stdout.contains("\n    show                let a human see and use this tab's window over VNC\n"), "{}", e.stdout);
         assert!(e.stdout.contains("\n    wait                wait until the tab reaches a state (URL, text, ...)\n"), "{}", e.stdout);
         assert!(e.stdout.contains("\n  3   timed out (tab show/wait --timeout)\n"), "{}", e.stdout);

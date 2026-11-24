@@ -1,0 +1,24 @@
+<!doctype html><html><head><meta charset=utf-8><title>Fake Bank login</title>
+<style>#banner{position:fixed;left:0;right:0;bottom:0;height:200px;background:#fee;z-index:9}
+.otp input{width:2em} body{height:1600px}</style></head><body>
+<h1>Sign in to Fake Bank</h1>
+<form id="f" onsubmit="event.preventDefault(); window.submitted=(window.submitted||0)+1; log('submit')">
+ <label for="em">Email address</label> <input id="em" name="email" autocomplete="username"><br>
+ <div style="display:none"><label>Email address <input name="ghost"></label></div>
+ <input id="pw" type="password" placeholder="Password"><br>
+ <input id="code" aria-label="Verification code" maxlength="6" inputmode="numeric"><br>
+ <div class="otp" role="group" aria-label="One-time code">
+  <input aria-label="Digit 1" maxlength="1"><input aria-label="Digit 2" maxlength="1"><input aria-label="Digit 3" maxlength="1"><input aria-label="Digit 4" maxlength="1"><input aria-label="Digit 5" maxlength="1"><input aria-label="Digit 6" maxlength="1">
+ </div>
+ <x-field></x-field>
+ <div style="margin-top:900px"><button type="submit">Sign in</button></div>
+</form>
+<div id="banner">We use cookies <button onclick="banner.remove()">Accept all</button></div>
+<script>
+window.events=[]; function log(e){events.push(e)}
+customElements.define('x-field', class extends HTMLElement{connectedCallback(){const r=this.attachShadow({mode:'open'});r.innerHTML='<label>Member number <input id="mem"></label>'}});
+document.querySelectorAll('input').forEach(i=>{i.addEventListener('focus',()=>log('focus:'+(i.id||i.name||i.ariaLabel)+':hasFocus='+document.hasFocus()));i.addEventListener('input',e=>log('input:'+(i.id||i.ariaLabel)+':'+e.isTrusted+':'+e.inputType))});
+const boxes=[...document.querySelectorAll('.otp input')];
+boxes.forEach((b,k)=>b.addEventListener('keydown',e=>{ if(/^[0-9]$/.test(e.key)){e.preventDefault(); b.value=e.key; if(boxes[k+1]) boxes[k+1].focus(); }}));
+window.check=()=>({email: em.value, pwLen: pw.value.length, pwOk: pw.value==='Tést pässwörd 123!', code: code.value, otp: boxes.map(b=>b.value).join(''), mem: document.querySelector('x-field').shadowRoot.querySelector('input').value, submitted: window.submitted||0});
+</script></body></html>

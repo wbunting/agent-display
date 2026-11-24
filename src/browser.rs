@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::cdp::cdp_send;
 use crate::ctx::*;
@@ -202,7 +202,10 @@ pub fn cdp_ready(ctx: &Ctx, port: u16, unit: &str) -> bool {
     cdp_problem(ctx, port, unit, 2.0).is_none()
 }
 
-pub fn chromium_argv(ctx: &Ctx, profile: &Path, port: u16, urls: &[String], extra: &[String]) -> Vec<String> {
+/// Chromium's command line. Always starts on about:blank: start URLs are
+/// opened over CDP once it is up (`open_start_urls`), so a one-time link
+/// never sits in the unit's ExecStart (`systemctl show`) or in /proc.
+pub fn chromium_argv(ctx: &Ctx, profile: &Path, port: u16, extra: &[String]) -> Vec<String> {
     let mut v = vec![
         ctx.env.get("AGENT_DISPLAY_CHROMIUM").unwrap_or(CHROMIUM).to_string(),
         "--ozone-platform=wayland".into(),
@@ -215,12 +218,113 @@ pub fn chromium_argv(ctx: &Ctx, profile: &Path, port: u16, urls: &[String], extr
         "--disable-session-crashed-bubble".into(),
     ];
     v.extend(extra.iter().cloned());
-    if urls.is_empty() {
-        v.push("about:blank".into());
-    } else {
-        v.extend(urls.iter().cloned());
-    }
+    v.push("about:blank".into());
     v
+}
+
+/// Preferences every agent profile gets before Chromium starts: no saving
+/// passwords (with --password-store=basic they would be stored only
+/// obfuscated in a profile agents share) and no autofill of addresses or
+/// cards into pages agents drive.
+pub const PROFILE_PREFS: &[(&str, bool)] = &[
+    ("credentials_enable_service", false),
+    ("credentials_enable_autosignin", false),
+    ("profile.password_manager_enabled", false),
+    ("autofill.enabled", false),
+    ("autofill.profile_enabled", false),
+    ("autofill.credit_card_enabled", false),
+];
+
+/// Merge PROFILE_PREFS into `<profile>/Default/Preferences` (0600,
+/// atomically). Call only while no Chromium has the profile open. A file
+/// that isn't a JSON object is left alone (Chromium would reset it).
+pub fn harden_profile_prefs(profile: &Path) -> Result<bool> {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = profile.join("Default");
+    std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&dir)?;
+    let path = dir.join("Preferences");
+    let mut prefs = match std::fs::read_to_string(&path) {
+        Ok(text) => match serde_json::from_str::<Value>(&text) {
+            Ok(v @ Value::Object(_)) => v,
+            _ => return Ok(false),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Value::Object(Map::new()),
+        Err(e) => return Err(e.into()),
+    };
+    for (key, value) in PROFILE_PREFS {
+        let mut node = &mut prefs;
+        let parts: Vec<&str> = key.split('.').collect();
+        for part in &parts[..parts.len() - 1] {
+            let m = node.as_object_mut().unwrap();
+            let next = m.entry(part.to_string()).or_insert_with(|| Value::Object(Map::new()));
+            if !next.is_object() {
+                *next = Value::Object(Map::new());
+            }
+            node = next;
+        }
+        node.as_object_mut().unwrap().insert(parts[parts.len() - 1].to_string(), Value::Bool(*value));
+    }
+    tab::write_atomic(&path, serde_json::to_string(&prefs).map_err(|e| crate::util::Error::new(e.to_string()))?.as_bytes())?;
+    Ok(true)
+}
+
+/// Start URLs from `browser start URL...`; `-` reads them from stdin, one
+/// per line, so they stay out of argv too.
+pub fn start_urls(ctx: &Ctx, urls: &[String]) -> Result<Vec<String>> {
+    if urls.iter().any(|u| u == "-") {
+        if urls.len() != 1 {
+            bail!("give URLs or `-`, not both");
+        }
+        let s = crate::redact::Secret::from_stdin(ctx, false)?;
+        let list: Vec<String> = s.expose().lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
+        if list.iter().any(|u| u.contains(char::is_whitespace)) {
+            bail!("stdin must hold one URL per line");
+        }
+        return Ok(list);
+    }
+    Ok(urls.to_vec())
+}
+
+/// Open start URLs in a browser that just came up: the first in its
+/// about:blank tab, the rest in new tabs. Best effort: the browser is up
+/// either way, so failures are warnings (with redacted URLs).
+pub fn open_start_urls(ctx: &Ctx, port: u16, urls: &[String]) {
+    if urls.is_empty() {
+        return;
+    }
+    let r = (|| -> Result<()> {
+        let blank = ctx
+            .sys
+            .cdp_targets(port, tab::TARGETS_TIMEOUT)?
+            .into_iter()
+            .find(|t| t["type"] == "page" && t["url"] == "about:blank")
+            .and_then(|t| t["id"].as_str().map(String::from));
+        let mut cdp = ctx.sys.cdp_connect(ctx, port, 10.0)?;
+        let mut rest = urls;
+        if let Some(id) = blank {
+            let nav = (|| -> Result<()> {
+                let a = cdp.call("Target.attachToTarget", json!({"targetId": id, "flatten": true}), None, None)?;
+                let sess = a["sessionId"].as_str().unwrap_or("").to_string();
+                let r = cdp.call("Page.navigate", json!({"url": urls[0]}), Some(&sess), None);
+                let _ = cdp.call("Target.detachFromTarget", json!({"sessionId": sess}), None, Some(5.0));
+                r.map(|_| ())
+            })();
+            if let Err(e) = nav {
+                ctx.eprintln(&format!("agent-display: could not open {}: {}", crate::redact::redact_url(&urls[0]), e.msg));
+            }
+            rest = &urls[1..];
+        }
+        for u in rest {
+            if let Err(e) = cdp.call("Target.createTarget", json!({"url": u}), None, None) {
+                ctx.eprintln(&format!("agent-display: could not open {}: {}", crate::redact::redact_url(u), e.msg));
+            }
+        }
+        cdp.close();
+        Ok(())
+    })();
+    if let Err(e) = r {
+        ctx.eprintln(&format!("agent-display: browser is up, but the start URLs did not open: {}", e.msg));
+    }
 }
 
 fn info_json(unit: &str, port: Value, profile: &Path, temp: bool) -> Map<String, Value> {
@@ -233,6 +337,7 @@ fn info_json(unit: &str, port: Value, profile: &Path, temp: bool) -> Map<String,
 }
 
 pub fn cmd_browser_start(ctx: &Ctx, temp: bool, port_arg: Option<i64>, audio: bool, urls: &[String]) -> Result<i32> {
+    let urls = start_urls(ctx, urls)?;
     let disp = display(ctx)?;
     let (port, mut profile, unit);
     if temp {
@@ -275,8 +380,14 @@ pub fn cmd_browser_start(ctx: &Ctx, temp: bool, port_arg: Option<i64>, audio: bo
             }
         }
         unlink_missing_ok(&profile.join("DevToolsActivePort"));
+        if !harden_profile_prefs(&profile)? {
+            ctx.eprintln(&format!(
+                "agent-display: {}/Default/Preferences is not a JSON object; password manager and autofill left as they are",
+                profile.display()
+            ));
+        }
         let extra: Vec<String> = if audio { vec![] } else { vec!["--mute-audio".into()] };
-        let argv = chromium_argv(ctx, &profile, port as u16, urls, &extra);
+        let argv = chromium_argv(ctx, &profile, port as u16, &extra);
         if !Path::new(&argv[0]).exists() {
             bail!("{} not found (set AGENT_DISPLAY_CHROMIUM)", argv[0]);
         }
@@ -285,7 +396,9 @@ pub fn cmd_browser_start(ctx: &Ctx, temp: bool, port_arg: Option<i64>, audio: bo
         });
         let mut full = env_argv(&ctx.minimal_env(&disp));
         full.extend(argv);
-        ctx.sys.systemd_run(ctx, &unit, &full, true, stop_post.as_deref(), Some(&format!("Agent Chromium ({})", profile.display())))?;
+        // No core dumps: a renderer's core holds whatever was typed into it.
+        let desc = format!("Agent Chromium ({})", profile.display());
+        ctx.sys.systemd_run(ctx, &unit, &full, true, stop_post.as_deref(), Some(&desc), &["LimitCORE=0"])?;
         Ok(profile)
     })();
     match setup {
@@ -320,6 +433,7 @@ pub fn cmd_browser_start(ctx: &Ctx, temp: bool, port_arg: Option<i64>, audio: bo
     let dir = ctx.browsers_dir();
     crate::util::mkdir_private(&dir)?;
     write_private(&dir.join(format!("{unit}.json")), &json::dumps(&info, true))?;
+    open_start_urls(ctx, actual, &urls);
     ctx.println(&json::dumps(&info, true));
     Ok(0)
 }

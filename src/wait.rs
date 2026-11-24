@@ -151,6 +151,8 @@ struct Waiter<'a, 'c> {
     ctx: &'a Ctx<'c>,
     tab: String,
     spec: WaitSpec,
+    /// `--show-url`: print url and title in full.
+    show_url: bool,
     start: Instant,
     deadline: Option<Instant>,
     port: Option<u16>,
@@ -224,10 +226,20 @@ impl<'a, 'c> Waiter<'a, 'c> {
         self.ctx.sys.sleep(self.until(0.0).map_or(t, |l| t.min(l)));
     }
 
-    /// Every line `tab wait` prints goes through here (URL hygiene, if any,
-    /// belongs here). `url` and `title` are the only page-derived values.
+    /// Every line `tab wait` prints goes through here. `url` and `title`
+    /// are the only page-derived values: unless --show-url, the URL is
+    /// redacted like every `tab` command's (a one-time sign-in link is often
+    /// exactly what a wait watches), and so is a title that is URL-like.
     fn print(&self, m: Map<String, Value>) {
-        self.ctx.println(&json::dumps(&Value::Object(m), false));
+        let mut v = Value::Object(m);
+        if !self.show_url {
+            let url = v.get("url").and_then(Value::as_str).unwrap_or("").to_string();
+            if let Some(Value::String(t)) = v.get_mut("title") {
+                *t = crate::redact::redact_title(t, &url);
+            }
+            crate::redact::redact_value(&mut v, false);
+        }
+        self.ctx.println(&json::dumps(&v, false));
     }
 
     /// url, title and matched of a page state (or nulls).
@@ -589,6 +601,7 @@ pub fn cmd_tab_wait(ctx: &Ctx, o: &TabOpts, tab: &str, spec: &WaitSpec) -> Resul
         ctx,
         tab: tab.to_string(),
         spec,
+        show_url: o.show_url,
         start,
         deadline: (o.timeout > 0.0).then(|| start + secs(o.timeout)),
         port: None,

@@ -167,8 +167,19 @@ pub trait Sys {
     fn stop_units(&self, ctx: &Ctx, units: &[String]) -> Result<()> {
         systemd::stop_units(ctx, units)
     }
-    fn systemd_run(&self, ctx: &Ctx, unit: &str, argv: &[String], bind: bool, stop_post: Option<&[String]>, description: Option<&str>) -> Result<()> {
-        systemd::systemd_run(ctx, unit, argv, bind, stop_post, description)
+    /// `props`: extra `-p` unit properties (e.g. `LimitCORE=0`).
+    #[allow(clippy::too_many_arguments)]
+    fn systemd_run(
+        &self,
+        ctx: &Ctx,
+        unit: &str,
+        argv: &[String],
+        bind: bool,
+        stop_post: Option<&[String]>,
+        description: Option<&str>,
+        props: &[&str],
+    ) -> Result<()> {
+        systemd::systemd_run(ctx, unit, argv, bind, stop_post, description, props)
     }
     fn browsers(&self, ctx: &Ctx) -> Vec<BrowserInfo> {
         browser::browsers_real(ctx)
@@ -230,6 +241,25 @@ pub trait Sys {
     }
     fn mkdtemp(&self, prefix: &str, dir: &Path) -> Result<PathBuf> {
         net::mkdtemp(prefix, dir)
+    }
+    fn stdin_is_tty(&self) -> bool {
+        // SAFETY: isatty on fd 0.
+        unsafe { libc::isatty(0) == 1 }
+    }
+    /// Up to `limit` bytes of stdin (to EOF).
+    fn read_stdin(&self, limit: usize) -> std::io::Result<Vec<u8>> {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        std::io::stdin().lock().take(limit as u64).read_to_end(&mut buf)?;
+        Ok(buf)
+    }
+    /// While this process holds a secret: no core dump, and no same-user
+    /// ptrace or /proc/PID/{mem,environ} (PR_SET_DUMPABLE 0).
+    fn no_core_dumps(&self) {
+        // SAFETY: plain prctl.
+        unsafe {
+            libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+        }
     }
 }
 

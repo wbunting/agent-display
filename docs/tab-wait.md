@@ -10,6 +10,7 @@ agent-display tab wait TAB [--port PORT] [--timeout S]
     [--url RE] [--url-not RE] [--title RE] [--text RE] [--text-not RE]
     [--selector CSS] [--selector-not CSS] [--js EXPR] [--gone]
     [--any] [--stable-ms N] [--follow] [--tick-ms N] [--dialog accept|dismiss]
+    [--show-url]
 ```
 
 ## Conditions
@@ -62,6 +63,10 @@ detaching) may run past it, so the command returns within `--timeout` + 1 s.
 Give a monitor's own timeout at least that much margin.
 
 `url`, `title` and `matched` are the last state seen (null if none was).
+Like every `tab` command's output, `url` is redacted unless `--show-url`:
+query and fragment values, userinfo and token-like path segments print as
+`…` (`https://bank.example/approve?token=…`), and so does a `title` that is
+URL-like. Conditions are evaluated in the page against the full URL.
 `timeout` and `stalled` lines include `stalled`: the error the browser was
 stalled on at the end (null for a plain timeout). With `--follow`, a line per event comes first:
 

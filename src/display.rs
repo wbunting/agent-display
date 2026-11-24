@@ -244,7 +244,7 @@ pub fn cmd_start(ctx: &Ctx, size: &str, renderer: Option<&str>) -> Result<i32> {
     argv.push(which("sway", &ctx.env).unwrap().to_string_lossy().into());
     argv.push("--config".into());
     argv.push(rt.join("sway.config").to_string_lossy().into());
-    ctx.sys.systemd_run(ctx, DISPLAY_UNIT.trim_end_matches(".service"), &argv, false, None, Some("Agent headless display (sway)"))?;
+    ctx.sys.systemd_run(ctx, DISPLAY_UNIT.trim_end_matches(".service"), &argv, false, None, Some("Agent headless display (sway)"), &[])?;
     let deadline = Instant::now() + Duration::from_secs(15);
     let disp = loop {
         match display(ctx) {
@@ -389,14 +389,29 @@ pub fn cmd_launch(ctx: &Ctx, name: &str, argv: &[String]) -> Result<i32> {
     let mut full = env_argv(&ctx.minimal_env(&disp));
     full.push(exe.to_string_lossy().into());
     full.extend(argv[1..].iter().cloned());
-    ctx.sys.systemd_run(ctx, &unit, &full, true, None, None)?;
+    ctx.sys.systemd_run(ctx, &unit, &full, true, None, None, &[])?;
     ctx.println(&format!("launched {unit}; stop with: systemctl --user stop {unit}"));
     Ok(0)
 }
 
-pub fn cmd_windows(ctx: &Ctx) -> Result<i32> {
+/// `windows`: every window on the shared display, other agents' too. A
+/// browser tab's window title can hold its URL (Chromium uses it as the
+/// title of a page without `<title>`), so URL-like titles are redacted
+/// unless `show_url`.
+pub fn cmd_windows(ctx: &Ctx, show_url: bool) -> Result<i32> {
     let disp = display(ctx)?;
-    let list = Value::Array(windows(ctx, &disp)?.iter().map(Window::to_json).collect());
+    let list = Value::Array(
+        windows(ctx, &disp)?
+            .iter()
+            .map(|w| {
+                let mut v = w.to_json();
+                if !show_url && let Some(t) = w.title.as_str() {
+                    v["title"] = crate::redact::redact_window_title(t).into();
+                }
+                v
+            })
+            .collect(),
+    );
     ctx.println(&json::dumps_indent(&list, 2, true));
     Ok(0)
 }
@@ -589,7 +604,7 @@ pub fn wayvnc_argv(ctx: &Ctx, disp: &Disp, prefix: &[String], w: &Wayvnc) -> Res
 pub fn start_wayvnc(ctx: &Ctx, unit: &str, argv: &[String], stop_post: Option<&[String]>, description: &str, ready: &dyn Fn() -> bool) -> Result<()> {
     let mut tries = 0;
     loop {
-        match ctx.sys.systemd_run(ctx, unit, argv, true, stop_post, Some(description)) {
+        match ctx.sys.systemd_run(ctx, unit, argv, true, stop_post, Some(description), &[]) {
             Ok(()) => break,
             Err(e) if e.msg.contains("already loaded") && tries < 25 => {
                 tries += 1;

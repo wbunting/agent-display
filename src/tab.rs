@@ -31,6 +31,7 @@ use serde_json::{Map, Value, json};
 use crate::browser::{OWNERSHIP_TIMEOUT, listener_problem};
 use crate::cdp::CdpConn;
 use crate::cli::TabOpts;
+use crate::redact::{redact_title, redact_url, redact_value, url_arg};
 use crate::ctx::*;
 use crate::display::{display, ensure_runtime_dir, walk, windows};
 use crate::util::{Error, FileLock, Result, absolute, b64decode, exit, fmt_g, hex, py_repr, random_bytes, unlink_missing_ok, write_private};
@@ -399,12 +400,14 @@ pub fn exception_text(d: &Value) -> String {
 /// open (see `cdp::Dialog` for why they must be answered) and noted on
 /// stderr, so a page's alert()/confirm() can't wedge the tab.
 pub struct Tab<'a, 'c> {
-    ctx: &'a Ctx<'c>,
+    pub ctx: &'a Ctx<'c>,
     pub port: u16,
     pub tab: String,
     pub timeout: f64,
     cdp: Box<dyn CdpConn>,
     session: String,
+    /// Sessions with focus emulation on, switched off again on drop.
+    emulated: Vec<String>,
 }
 
 impl<'a, 'c> Tab<'a, 'c> {
@@ -423,7 +426,7 @@ impl<'a, 'c> Tab<'a, 'c> {
             bail!("Target.attachToTarget: no sessionId");
         };
         cdp.set_dialog_policy(false);
-        let mut t = Tab { ctx, port, tab: tab.to_string(), timeout, cdp, session };
+        let mut t = Tab { ctx, port, tab: tab.to_string(), timeout, cdp, session, emulated: Vec::new() };
         // Page events report dialogs (and the load event `goto` waits for).
         t.call("Page.enable", json!({}), None)?;
         Ok(t)
@@ -431,6 +434,28 @@ impl<'a, 'c> Tab<'a, 'c> {
 
     pub fn call(&mut self, method: &str, params: Value, timeout: Option<f64>) -> Result<Value> {
         self.cdp.call(method, params, Some(&self.session), timeout)
+    }
+
+    /// Point later calls at another flat session (an out-of-process
+    /// iframe); returns the previous one. Restore the page's before drop.
+    pub fn swap_session(&mut self, session: String) -> String {
+        std::mem::replace(&mut self.session, session)
+    }
+
+    pub fn session(&self) -> &str {
+        &self.session
+    }
+
+    /// Make the current session's page behave as focused (an agent tab's
+    /// window never has OS focus, so `document.hasFocus()` is false and
+    /// focus/blur handlers misbehave). Undone when the Tab drops.
+    pub fn emulate_focus(&mut self) {
+        if self.emulated.contains(&self.session) {
+            return;
+        }
+        if self.call("Emulation.setFocusEmulationEnabled", json!({"enabled": true}), Some(5.0)).is_ok() {
+            self.emulated.push(self.session.clone());
+        }
     }
 
     pub fn wait(&mut self, method: &str, timeout: Option<f64>) -> Result<Value> {
@@ -468,14 +493,18 @@ impl<'a, 'c> Tab<'a, 'c> {
         let timeout = or_default(timeout, self.timeout);
         let res = self.call("Page.navigate", json!({"url": url}), Some(timeout))?;
         if let Some(err) = res.get("errorText").filter(|v| truthy(v)) {
-            bail!("navigate {url}: {}", err.as_str().map(String::from).unwrap_or_else(|| err.to_string()));
+            bail!("navigate {}: {}", redact_url(url), err.as_str().map(String::from).unwrap_or_else(|| err.to_string()));
         }
         // Same-document navigations (#hash) have no loader and no load event.
         if wait_load
             && res.get("loaderId").is_some_and(truthy)
             && self.wait("Page.loadEventFired", Some(timeout)).is_err()
         {
-            bail!("{url} did not finish loading in {}s; use --wait-ms to wait a fixed time instead", fmt_g(timeout));
+            bail!(
+                "{} did not finish loading in {}s; use --wait-ms to wait a fixed time instead",
+                redact_url(url),
+                fmt_g(timeout)
+            );
         }
         if let Some(ms) = wait_ms.filter(|ms| *ms != 0) {
             self.ctx.sys.sleep(ms as f64 / 1000.0);
@@ -537,6 +566,10 @@ impl<'a, 'c> Tab<'a, 'c> {
 
 impl Drop for Tab<'_, '_> {
     fn drop(&mut self) {
+        for s in std::mem::take(&mut self.emulated) {
+            let p = json!({"enabled": false});
+            let _ = self.cdp.call("Emulation.setFocusEmulationEnabled", p, Some(&s), Some(5.0));
+        }
         detach_answering_dialogs(self.ctx, self.cdp.as_mut(), &self.session, DIALOG_BARRIER + DETACH_TIMEOUT);
         report_dialogs(self.ctx, &self.tab, &self.cdp.take_dialogs());
         self.cdp.close();
@@ -863,6 +896,11 @@ fn close_target(ctx: &Ctx, port: u16, tab: &str) -> Result<Value> {
 }
 
 pub fn cmd_tab_open(ctx: &Ctx, o: &TabOpts, url: Option<&str>) -> Result<i32> {
+    let url = match url {
+        Some(u) => Some(url_arg(ctx, u)?),
+        None => None,
+    };
+    let url = url.as_deref();
     let port = tab_port(ctx, o.port_raw)?;
     let (tab, output) = {
         let mut cdp = ctx.sys.cdp_connect(ctx, port, 10.0).map_err(stalled)?;
@@ -897,12 +935,16 @@ pub fn cmd_tab_open(ctx: &Ctx, o: &TabOpts, url: Option<&str>) -> Result<i32> {
             }
         }
     }
-    ctx.println(&json::dumps(&Value::Object(out), true));
+    let mut out = Value::Object(out);
+    redact_value(&mut out, o.show_url);
+    ctx.println(&json::dumps(&out, true));
     Ok(0)
 }
 
 pub fn cmd_tab_goto(ctx: &Ctx, o: &TabOpts, tab: &str, url: &str, wait_ms: Option<i64>) -> Result<i32> {
-    let info = Tab::open(ctx, tab, o.port_raw, o.timeout)?.goto(url, wait_ms, wait_ms.is_none(), None)?;
+    let url = url_arg(ctx, url)?;
+    let mut info = Tab::open(ctx, tab, o.port_raw, o.timeout)?.goto(&url, wait_ms, wait_ms.is_none(), None)?;
+    redact_value(&mut info, o.show_url);
     ctx.println(&json::dumps(&info, true));
     Ok(0)
 }
@@ -926,7 +968,9 @@ pub fn cmd_tab_info(ctx: &Ctx, o: &TabOpts, tab: &str) -> Result<i32> {
     if let Value::Object(m) = info {
         out.extend(m);
     }
-    ctx.println(&json::dumps(&Value::Object(out), false));
+    let mut out = Value::Object(out);
+    redact_value(&mut out, o.show_url);
+    ctx.println(&json::dumps(&out, false));
     Ok(0)
 }
 
@@ -1018,14 +1062,23 @@ pub fn cmd_tab_list(ctx: &Ctx, o: &TabOpts) -> Result<i32> {
             let mut m = Map::new();
             m.insert("tab".into(), t.get("id").cloned().unwrap_or(Value::Null));
             m.insert("url".into(), t.get("url").cloned().unwrap_or(Value::Null));
-            m.insert("title".into(), t.get("title").cloned().unwrap_or(Value::Null));
+            let mut title = t.get("title").cloned().unwrap_or(Value::Null);
+            // Chromium shows the URL as the title of a page without one.
+            if !o.show_url
+                && let Value::String(s) = &title
+            {
+                title = redact_title(s, t.get("url").and_then(Value::as_str).unwrap_or("")).into();
+            }
+            m.insert("title".into(), title);
             Value::Object(m)
         })
         .collect();
     let mut out = Map::new();
     out.insert("port".into(), port.into());
     out.insert("tabs".into(), Value::Array(tabs));
-    ctx.println(&json::dumps_indent(&Value::Object(out), 2, false));
+    let mut out = Value::Object(out);
+    redact_value(&mut out, o.show_url);
+    ctx.println(&json::dumps_indent(&out, 2, false));
     Ok(0)
 }
 

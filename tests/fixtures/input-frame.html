@@ -1,0 +1,5 @@
+<!doctype html><meta charset=utf-8><title>Frame parent</title>
+<h1>Parent</h1>
+<!-- localhost vs 127.0.0.1: another site, so Chromium runs the login page in an out-of-process iframe. -->
+<script>document.write('<iframe id=bank src="http://localhost:' + location.port + '/input-login.html" width=800 height=600></iframe>')</script>
+<div id=same><iframe src="input-child.html" width=400 height=120></iframe></div>
