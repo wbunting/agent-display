@@ -654,17 +654,16 @@ fn follow(
                     ctx.sys.sleep(left.min(TAB_POLL).min((next_check - now).as_secs_f64()));
                     continue;
                 }
-                // Stopped only if systemd says so: an unknown state (systemctl
-                // failing) is looked at again later, until the deadline.
+                // Only systemd ends the view here, whether or not a viewer was
+                // seen: confirmed stopping or stopped (a last client leaving
+                // makes wayvnc exit, --exit-on-disconnect). Running: only
+                // wayvncctl ended (a human may still be connected), so reopen
+                // the stream below. Unknown (systemctl failing) or in
+                // transition: look again later, until the deadline.
                 let state = ctx.sys.unit_active_state(ctx, v.unit);
                 let stopped = state.as_deref().is_some_and(stopping_or_stopped);
                 let running = state.as_deref().is_some_and(is_running);
-                // systemd decides, not whether a viewer was seen: if wayvnc
-                // still runs, only wayvncctl ended (a human may still be
-                // connected), so reopen the stream below. Ended: confirmed
-                // stopped, or a viewer was seen and the unit isn't running
-                // (its last client left and --exit-on-disconnect exited it).
-                if stopped || (seen_viewer && !running) {
+                if stopped {
                     if until {
                         // Nobody can see the tab any more, but the condition
                         // can still be met: keep watching the tab.

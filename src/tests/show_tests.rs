@@ -1475,3 +1475,66 @@ fn closed_tab_ends_until_closed_even_with_another_browser_stalled() {
     assert_eq!(lines(&out).last().unwrap(), &json!({"unshown": tab, "reason": "closed"}));
     assert!(t0.elapsed().as_secs_f64() < 3.0, "{:?}", t0.elapsed());
 }
+
+// ------------------------------------------------------------ round 12
+// After a human connected, an unknown viewer state (systemctl failing) is
+// not "the viewer is gone" either: look again, then reopen.
+
+/// Once `follow` starts polling (the 2nd getTargetInfo), the viewer unit's
+/// state can't be read for the next `n` checks.
+fn unknown_state_once_following(f: &Fx, n: usize, url_after: Option<usize>, tab: &str) {
+    let unknown = f.sys.vnc_unknown_checks.clone();
+    let t2 = tab.to_string();
+    let mut polls = 0;
+    f.b.set_hook(move |m, _| {
+        if m == "Target.getTargetInfo" {
+            polls += 1;
+            if polls == 2 {
+                unknown.set(n);
+            }
+            if url_after.is_some_and(|k| polls >= k) {
+                return Hook::Return(Ok(json!({"targetInfo": {"targetId": t2, "type": "page",
+                    "url": "https://bank.example/home", "title": ""}})));
+            }
+        }
+        Hook::Pass
+    });
+}
+
+#[test]
+fn wait_viewer_with_a_connected_human_and_an_unknown_state_keeps_the_view() {
+    let mut f = fx();
+    f.sys.real_sleep_cap = Some(0.01);
+    let (tab, _) = opened(&f);
+    unknown_state_once_following(&f, 2, None, &tab);
+    // Human connected; wayvncctl dies; systemctl fails twice; then the unit
+    // reads active, the stream is reopened and the real disconnect arrives.
+    f.sys.vnc_script.borrow_mut().extend([ev("client-connected", 1), VncEvent::Closed]);
+    f.sys.vnc_more_scripts.borrow_mut().push_back(vec![VncEvent::Idle, ev("client-disconnected", 0)]);
+    let (code, out, err) = f.cli(&["show", "--wait-viewer", "--timeout", "15", &tab]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(&lines(&out)[1..], &[
+        json!({"viewer": "connected", "clients": 1}),
+        json!({"viewer": "disconnected", "clients": 0}),
+        json!({"unshown": tab, "reason": "disconnected"}),
+    ]);
+    assert_eq!(f.sys.vnc_unknown_checks.get(), 0, "the unknown checks were looked past");
+    assert_eq!(*f.sys.vnc_waits.borrow(), vec![true, false], "reopened once systemd said active");
+    assert!(stopped(&f).is_empty(), "never stopped under the human: {:?}", stopped(&f));
+}
+
+#[test]
+fn until_url_with_a_connected_human_and_an_unknown_state_doesnt_claim_stopped() {
+    let mut f = fx();
+    f.sys.real_sleep_cap = Some(0.01);
+    let (tab, _) = opened(&f);
+    unknown_state_once_following(&f, 2, Some(12), &tab);
+    f.sys.vnc_script.borrow_mut().extend([ev("client-connected", 1), VncEvent::Closed]);
+    let (code, out, err) = f.cli(&["show", "--until-url", "/home", "--timeout", "15", &tab]);
+    assert_eq!(code, 0, "{err}");
+    let l = lines(&out);
+    assert!(!l.contains(&json!({"viewer": "stopped"})), "{l:?}");
+    assert!(!l.iter().any(|v| v["viewer"] == "disconnected"), "{l:?}");
+    assert_eq!(l.last().unwrap(), &json!({"unshown": tab, "reason": "url-matched"}));
+    assert_eq!(f.sys.vnc_unknown_checks.get(), 0);
+}

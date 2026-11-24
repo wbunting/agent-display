@@ -53,7 +53,7 @@ pub const LOOKUP_BUDGET: f64 = 15.0;
 pub const LOOKUP_STEP_TIMEOUT: f64 = 5.0;
 pub const LOOKUP_BACKOFF: &[f64] = &[0.5, 1.0, 2.0, 4.0];
 /// Pause before asking again whether a tab that looked gone really is.
-pub const GONE_RECHECK: f64 = 0.25;
+const GONE_RECHECK: f64 = 0.25;
 
 pub fn valid_tab_id(tab: &str) -> bool {
     (8..=64).contains(&tab.len()) && tab.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
@@ -237,17 +237,11 @@ fn scan(ctx: &Ctx, tab: &str, port: Option<i64>, step: f64) -> Scan {
     if problems.is_empty() { Scan::Missing } else { Scan::Unavailable(problems) }
 }
 
-/// Is TAB still in a running agent-display browser? `Some(false)` only on
-/// two definitive misses ~250 ms apart (or no browser running); `None` when
-/// a browser didn't answer. One pass, no retries: for cleanup decisions.
-pub fn tab_alive(ctx: &Ctx, tab: &str) -> Option<bool> {
-    locate(ctx, tab, None, LOOKUP_STEP_TIMEOUT).map(|f| f.is_some())
-}
-
-/// `tab_alive` that keeps what it found: Some(Some(found)) with an open
-/// connection to the tab's browser, Some(None) gone (two definitive misses
-/// ~250 ms apart, or no browser), None no definitive answer. One scan per
-/// pass, `step` per CDP step; no retries beyond the recheck.
+/// Is TAB still in a running agent-display browser (or the one on `port`)?
+/// Some(Some(found)) with an open connection to the tab's browser,
+/// Some(None) gone (two definitive misses ~250 ms apart, or no browser),
+/// None no definitive answer (a browser didn't answer). One scan per pass,
+/// `step` per CDP step; no retries beyond the recheck.
 pub fn locate(ctx: &Ctx, tab: &str, port: Option<i64>, step: f64) -> Option<Option<Found>> {
     for pass in 0..2 {
         match scan(ctx, tab, port, step) {

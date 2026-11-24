@@ -152,6 +152,9 @@ pub struct FakeSys {
     /// Scripts for later vnc_events calls (reopened streams), in order;
     /// none left: a stream that is Closed at once (wayvncctl failed).
     pub vnc_more_scripts: RefCell<VecDeque<Vec<VncEvent>>>,
+    /// The next N unit_active_state calls for viewer units fail (None, as
+    /// when systemctl times out); Rc so a hook can arm it mid-command.
+    pub vnc_unknown_checks: Rc<std::cell::Cell<usize>>,
     /// unit_active_state calls for viewer units (systemctl spawns).
     pub vnc_state_checks: RefCell<usize>,
     /// The next N systemd_run calls fail like systemd-run for a transient
@@ -341,6 +344,11 @@ impl Sys for FakeSys {
         let u = unit.trim_end_matches(".service");
         if u.starts_with("agent-display-vnc-") {
             *self.vnc_state_checks.borrow_mut() += 1;
+            let left = self.vnc_unknown_checks.get();
+            if left > 0 {
+                self.vnc_unknown_checks.set(left - 1);
+                return None;
+            }
         }
         if *self.states_unknown.borrow() || self.unknown_prefix.borrow().as_deref().is_some_and(|p| u.starts_with(p)) {
             return None;
