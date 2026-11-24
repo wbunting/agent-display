@@ -892,8 +892,9 @@ fn broken_connection_to_a_live_tab_reconnects_and_keeps_watching() {
     let (code, out, err) = f.cli(&["show", "--until-url", "/home", "--timeout", "30", &tab]);
     assert_eq!(code, 0, "{err}");
     assert_eq!(lines(&out).last().unwrap(), &json!({"unshown": tab, "reason": "url-matched"}));
-    // lookup + tab_alive's probe + the reconnect's lookup: 3 connections.
-    assert!(*f.sys.version_calls.borrow() - before >= 3, "reconnected");
+    // show's lookup, then one scan that both finds the tab and keeps its
+    // fresh connection: 2 connections, not a check plus a second lookup.
+    assert_eq!(*f.sys.version_calls.borrow() - before, 2, "reconnected with one scan");
 }
 
 #[test]
@@ -1292,4 +1293,97 @@ fn view_says_what_the_running_viewer_actually_does() {
     assert_eq!(code, 0);
     assert!(out.contains("was started without --exit-on-disconnect and keeps its options"), "{out}");
     assert!(out.contains("`agent-display unview` first"), "{out}");
+}
+
+// ------------------------------------------------------------ follow's reconnect (round 10)
+
+/// Right after show's own lookup: every existing connection dies (or hangs,
+/// with `dead_error`), the tab's URL becomes the sign-in target, and new
+/// connections can't be made for `stall_secs` (/json/version times out).
+fn connections_die_after_lookup(f: &mut Fx, tab: &str, dead_error: &str, stall_secs: f64) {
+    let stall_until: std::rc::Rc<std::cell::Cell<Option<std::time::Instant>>> = Default::default();
+    let s2 = stall_until.clone();
+    f.sys_version_fail(move |_| match s2.get() {
+        Some(t) if std::time::Instant::now() < t => Some(Error::os("timed out")),
+        _ => None,
+    });
+    f.b.st().dead_error = dead_error.into();
+    let b = f.b.clone();
+    let t2 = tab.to_string();
+    let mut n = 0;
+    f.b.set_hook(move |m, _| {
+        if m == "Target.getTargetInfo" {
+            n += 1;
+            if n == 1 {
+                let mut st = b.st();
+                st.dead_before = st.next_conn; // this lookup's connection too
+                st.targets.iter_mut().find(|(k, _)| *k == t2).unwrap().1["url"] = json!("https://bank.example/home");
+                if stall_secs > 0.0 {
+                    stall_until.set(Some(std::time::Instant::now() + std::time::Duration::from_secs_f64(stall_secs)));
+                }
+            }
+        }
+        Hook::Pass
+    });
+}
+
+#[test]
+fn broken_connection_rechecks_are_throttled_while_nothing_answers() {
+    // The connection drops and the browser doesn't answer for 2 s: one
+    // fresh look at once, the next after STALL_RECHECK (5 s), which finds the
+    // tab, switches connections and sees the URL. Not a scan per poll.
+    let mut f = fx();
+    f.sys.real_sleep_cap = Some(0.01);
+    let (tab, _) = opened(&f);
+    connections_die_after_lookup(&mut f, &tab, "CDP closed the connection", 2.0);
+    f.sys.vnc_script.borrow_mut().extend([ev("client-connected", 1), ev("client-disconnected", 0), VncEvent::Closed]);
+    let before = *f.sys.version_calls.borrow();
+    let t0 = std::time::Instant::now();
+    let (code, out, err) = f.cli(&["show", "--until-url", "/home", "--timeout", "30", &tab]);
+    let took = t0.elapsed().as_secs_f64();
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(lines(&out).last().unwrap(), &json!({"unshown": tab, "reason": "url-matched"}));
+    // show's lookup + the look at once (stalled) + the look at 5 s (found).
+    let connects = *f.sys.version_calls.borrow() - before;
+    assert!(connects <= 4, "{connects} connection attempts");
+    assert!((5.0..9.0).contains(&took), "{took}");
+}
+
+#[test]
+fn a_hanging_connection_is_replaced_when_a_fresh_one_answers() {
+    // Polls on the old connection only time out; a fresh connection reaches
+    // the tab. After STALL_RECHECK the view switches to it and sees the
+    // sign-in land, instead of waiting on the hung one until --timeout.
+    let mut f = fx();
+    f.sys.real_sleep_cap = Some(0.01);
+    let (tab, _) = opened(&f);
+    connections_die_after_lookup(&mut f, &tab, "timed out waiting for Target.getTargetInfo", 0.0);
+    f.sys.vnc_script.borrow_mut().extend([ev("client-connected", 1), ev("client-disconnected", 0), VncEvent::Closed]);
+    let t0 = std::time::Instant::now();
+    let (code, out, err) = f.cli(&["show", "--until-url", "/home", "--timeout", "9", &tab]);
+    let took = t0.elapsed().as_secs_f64();
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(lines(&out).last().unwrap(), &json!({"unshown": tab, "reason": "url-matched"}));
+    assert!((5.0..8.0).contains(&took), "{took}");
+}
+
+#[test]
+fn view_steps_are_bounded_by_its_deadline() {
+    // A 2 s view: its polls and the fresh look's CDP steps never ask for
+    // more than the time left (no 5 s step, no 15 s lookup budget).
+    let mut f = fx();
+    f.sys.real_sleep_cap = Some(0.01);
+    let (tab, _) = opened(&f);
+    connections_die_after_lookup(&mut f, &tab, "CDP closed the connection", 60.0);
+    f.sys.vnc_script.borrow_mut().extend([ev("client-connected", 1), ev("client-disconnected", 0), VncEvent::Closed]);
+    f.b.st().effective.clear();
+    f.sys.version_timeouts.borrow_mut().clear();
+    let (code, _, err) = f.cli(&["show", "--until-url", "/nowhere", "--timeout", "2", &tab]);
+    assert_eq!(code, 3, "{err}");
+    let polls: Vec<f64> =
+        f.b.st().effective.iter().filter(|(m, _)| m == "Target.getTargetInfo").skip(1).map(|(_, t)| *t).collect();
+    assert!(!polls.is_empty() && polls.iter().all(|t| *t <= 2.0), "{polls:?}");
+    // The fresh look's connects (after show's own lookup).
+    let looks: Vec<f64> = f.sys.version_timeouts.borrow().iter().skip(1).copied().collect();
+    assert!(!looks.is_empty() && looks.iter().all(|t| *t <= 2.0), "{looks:?}");
 }

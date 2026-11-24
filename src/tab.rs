@@ -241,16 +241,24 @@ fn scan(ctx: &Ctx, tab: &str, port: Option<i64>, step: f64) -> Scan {
 /// two definitive misses ~250 ms apart (or no browser running); `None` when
 /// a browser didn't answer. One pass, no retries: for cleanup decisions.
 pub fn tab_alive(ctx: &Ctx, tab: &str) -> Option<bool> {
+    locate(ctx, tab, None, LOOKUP_STEP_TIMEOUT).map(|f| f.is_some())
+}
+
+/// `tab_alive` that keeps what it found: Some(Some(found)) with an open
+/// connection to the tab's browser, Some(None) gone (two definitive misses
+/// ~250 ms apart, or no browser), None no definitive answer. One scan per
+/// pass, `step` per CDP step; no retries beyond the recheck.
+pub fn locate(ctx: &Ctx, tab: &str, port: Option<i64>, step: f64) -> Option<Option<Found>> {
     for pass in 0..2 {
-        match scan(ctx, tab, None, LOOKUP_STEP_TIMEOUT) {
-            Scan::Found(_) => return Some(true),
-            Scan::NoBrowser => return Some(false),
+        match scan(ctx, tab, port, step) {
+            Scan::Found(f) => return Some(Some(f)),
+            Scan::NoBrowser => return Some(None),
             Scan::Unavailable(_) => return None,
             Scan::Missing if pass == 0 => ctx.sys.sleep(GONE_RECHECK),
             Scan::Missing => {}
         }
     }
-    Some(false)
+    Some(None)
 }
 
 /// Find TAB in the agent-display browsers (or the one on `port`). Errors

@@ -31,7 +31,11 @@ use serde_json::{Map, Value, json};
 use crate::cli::{ShowOpts, TabOpts};
 use crate::ctx::*;
 use crate::display::{Wayvnc, display, start_wayvnc, wayvnc_argv};
-use crate::tab::{Found, GONE_RECHECK, lookup, marked_outputs, no_such_target, output_windows, owned_ports, tab_alive, valid_tab_id};
+use crate::systemd::{is_running, stopping_or_stopped};
+use crate::tab::{
+    Found, GONE_RECHECK, LOOKUP_STEP_TIMEOUT, locate, lookup, marked_outputs, no_such_target, output_windows,
+    owned_ports, tab_alive, valid_tab_id,
+};
 use crate::util::{Error, FileLock, Result, mkdir_private, exit, fmt_g, hex, is_socket, py_repr, random_bytes, unlink_missing_ok, which, write_private};
 use crate::{bail, json};
 
@@ -132,10 +136,7 @@ fn write_state(ctx: &Ctx, output: &str, st: &ViewerState) -> Result<()> {
 /// say it is stopping or stopped (an unknown state counts as up).
 fn viewer_up(ctx: &Ctx, output: &str) -> bool {
     is_socket(&viewer_socket(ctx, output))
-        && !matches!(
-            ctx.sys.unit_active_state(ctx, &viewer_unit(output)).as_deref(),
-            Some("deactivating" | "inactive" | "failed")
-        )
+        && !ctx.sys.unit_active_state(ctx, &viewer_unit(output)).as_deref().is_some_and(stopping_or_stopped)
 }
 
 /// The token of the viewer currently recorded for `output`.
@@ -364,14 +365,14 @@ pub fn cmd_tab_show(ctx: &Ctx, o: &TabOpts, tab: &str, s: &ShowOpts) -> Result<i
     // waits out a stopping unit).
     let has_files = [&sock, &viewer_control(ctx, &output), &viewer_state(ctx, &output)].iter().any(|f| f.exists());
     let running = match ctx.sys.unit_active_state(ctx, &unit).as_deref() {
-        Some("active" | "reloading" | "refreshing") if is_socket(&sock) => true,
-        Some("active" | "reloading" | "refreshing") => {
+        Some(s) if is_running(s) && is_socket(&sock) => true,
+        Some(s) if is_running(s) => {
             return Err(Error::new(format!(
                 "a viewer of {output} is running without its socket; `agent-display tab unshow {tab}` first"
             ))
             .with_code(exit::TEMPFAIL));
         }
-        Some("deactivating" | "inactive" | "failed") => false,
+        Some(s) if stopping_or_stopped(s) => false,
         // Unknown (systemctl failed) or starting: fine only if nothing of a
         // viewer is here; systemd-run still refuses a loaded unit.
         _ if !has_files => false,
@@ -525,8 +526,11 @@ impl View<'_> {
 ///
 /// The tab is polled on the connection `lookup` opened. A poll that fails
 /// with a broken connection (browser exited or restarted) makes it look the
-/// tab up afresh at once; one that keeps timing out (a stalled browser) does
-/// after STALL_RECHECK. Gone ends the view; alive reconnects.
+/// tab up afresh at once (`locate`: one scan, which also returns a fresh
+/// connection); one that keeps timing out (a stalled browser) does after
+/// STALL_RECHECK; further looks are at most every STALL_RECHECK. Gone ends
+/// the view; found switches to the fresh connection. Every CDP step is
+/// bounded by the view's deadline.
 fn follow(
     ctx: &Ctx,
     v: &View,
@@ -537,8 +541,9 @@ fn follow(
     port_arg: Option<i64>,
 ) -> Result<i32> {
     let Found { mut port, mut cdp, .. } = found;
-    // When polls started failing (None while they answer).
-    let mut failing_since: Option<Instant> = None;
+    // While polls fail: when to look the tab up afresh (None while they
+    // answer).
+    let mut recheck_at: Option<Instant> = None;
     let tab = v.tab;
     let until = until_url.is_some() || s.until_closed;
     let mut seen_viewer = false;
@@ -594,9 +599,11 @@ fn follow(
         }
         if viewer_gone || Instant::now() >= next_poll {
             next_poll = Instant::now() + Duration::from_secs_f64(TAB_POLL);
-            match cdp.call("Target.getTargetInfo", json!({"targetId": tab}), None, Some(5.0)) {
+            // Bounded by the view's deadline, like every step below.
+            let step = left.clamp(0.05, LOOKUP_STEP_TIMEOUT);
+            match cdp.call("Target.getTargetInfo", json!({"targetId": tab}), None, Some(step)) {
                 Ok(r) => {
-                    failing_since = None;
+                    recheck_at = None;
                     let url = r["targetInfo"]["url"].as_str().unwrap_or("");
                     // Never print the URL: after a sign-in it can hold codes.
                     if until_url.is_some_and(|re| re.is_match(url)) {
@@ -610,26 +617,26 @@ fn follow(
                     }
                 }
                 Err(e) => {
-                    // A timeout is a busy browser until it has lasted
-                    // STALL_RECHECK; a broken connection never gets better.
-                    let broken = !e.is_timeout();
-                    let since = *failing_since.get_or_insert_with(Instant::now);
-                    if broken || since.elapsed().as_secs_f64() >= STALL_RECHECK {
-                        failing_since = Some(Instant::now());
-                        match tab_alive(ctx, tab) {
-                            Some(false) => return gone(port),
-                            // Alive: poll it on a fresh connection.
-                            Some(true) if broken => match lookup(ctx, tab, port_arg) {
-                                Ok(f) => {
-                                    port = f.port;
-                                    cdp = f.cdp;
-                                    failing_since = None;
-                                }
-                                Err(e) if e.code == exit::GONE || e.code == exit::BROWSER_DOWN => return gone(port),
-                                Err(_) => {}
-                            },
-                            // Still busy (or unknown): keep showing.
-                            _ => {}
+                    // Look the tab up afresh: at once for a broken connection
+                    // (it never gets better), after STALL_RECHECK of timeouts
+                    // (a busy browser); then at most every STALL_RECHECK
+                    // while no fresh look settles it.
+                    let now = Instant::now();
+                    let stall = Duration::from_secs_f64(STALL_RECHECK);
+                    let due = *recheck_at.get_or_insert(if e.is_timeout() { now + stall } else { now });
+                    if now >= due {
+                        recheck_at = Some(now + stall);
+                        match locate(ctx, tab, port_arg, step) {
+                            // Answered on a fresh connection: poll on that
+                            // one (whether the old one broke or only hangs).
+                            Some(Some(f)) => {
+                                port = f.port;
+                                cdp = f.cdp;
+                                recheck_at = None;
+                            }
+                            Some(None) => return gone(port),
+                            // No definitive answer: keep showing.
+                            None => {}
                         }
                     }
                 }
@@ -657,7 +664,7 @@ fn follow(
                 // Stopped only if systemd says so: an unknown state (systemctl
                 // failing) is looked at again later, until the deadline.
                 let state = ctx.sys.unit_active_state(ctx, v.unit);
-                let stopped = matches!(state.as_deref(), Some("deactivating" | "inactive" | "failed"));
+                let stopped = state.as_deref().is_some_and(stopping_or_stopped);
                 if seen_viewer || stopped {
                     if until {
                         // Nobody can see the tab any more, but the condition
@@ -676,7 +683,7 @@ fn follow(
                 // Back off the state checks meanwhile.
                 next_check = Instant::now() + Duration::from_secs_f64(backoff);
                 backoff = (backoff * 2.0).min(STREAM_BACKOFF_MAX);
-                if state.as_deref() == Some("active") && Instant::now() >= reopen_at {
+                if state.as_deref().is_some_and(is_running) && Instant::now() >= reopen_at {
                     reopen_at = Instant::now() + Duration::from_secs_f64(STREAM_REOPEN);
                     if let Ok(fresh) = ctx.sys.vnc_events(ctx, &viewer_control(ctx, v.output), false) {
                         events = fresh;

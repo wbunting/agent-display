@@ -594,7 +594,7 @@ pub fn start_wayvnc(ctx: &Ctx, unit: &str, argv: &[String], stop_post: Option<&[
             Err(e) if e.msg.contains("already loaded") && tries < 25 => {
                 tries += 1;
                 match ctx.sys.unit_active_state(ctx, unit).as_deref() {
-                    Some("deactivating" | "inactive" | "failed") => {
+                    Some(s) if crate::systemd::stopping_or_stopped(s) => {
                         let _ = ctx.sys.stop_units(ctx, &[unit.to_string()]);
                         ctx.sys.sleep(0.2);
                     }
@@ -617,7 +617,9 @@ pub fn start_wayvnc(ctx: &Ctx, unit: &str, argv: &[String], stop_post: Option<&[
     let deadline = Instant::now() + Duration::from_secs(10);
     while !ready() {
         // Gives up early only on a confirmed stop: an unknown state waits.
-        let stopped = || matches!(ctx.sys.unit_active_state(ctx, unit).as_deref(), Some("inactive" | "failed"));
+        let stopped = || {
+            ctx.sys.unit_active_state(ctx, unit).as_deref().map(crate::systemd::state_active) == Some(Some(false))
+        };
         if Instant::now() > deadline || stopped() {
             let log = journal_tail(ctx, unit, 12);
             let _ = ctx.sys.stop_units(ctx, &[unit.to_string()]);

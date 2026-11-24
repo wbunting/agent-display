@@ -377,7 +377,12 @@ impl Sys for FakeSys {
         if b.st().fail_connect || b.st().down {
             return Err(Error::os("[Errno 111] Connection refused"));
         }
-        Ok(Box::new(FakeConn { b, port, default: timeout }))
+        let id = {
+            let mut st = b.st();
+            st.next_conn += 1;
+            st.next_conn - 1
+        };
+        Ok(Box::new(FakeConn { b, port, default: timeout, id }))
     }
     fn display(&self, ctx: &Ctx) -> Result<Disp> {
         match &self.display {
@@ -445,6 +450,12 @@ pub struct BrowserState {
     pub fail_connect: bool,
     /// The browser has exited: no longer registered, connections refused.
     pub down: bool,
+    /// Connections get ids from this counter; those below `dead_before`
+    /// fail every call with `dead_error` (a dropped WebSocket, or one that
+    /// only hangs), while new connections work.
+    pub next_conn: usize,
+    pub dead_before: usize,
+    pub dead_error: String,
 }
 
 #[derive(Clone)]
@@ -466,6 +477,9 @@ impl FakeBrowser {
             sway: None,
             fail_connect: false,
             down: false,
+            next_conn: 0,
+            dead_before: 0,
+            dead_error: "CDP closed the connection".into(),
         })))
     }
 
@@ -597,6 +611,7 @@ pub struct FakeConn {
     port: u16,
     /// Default call timeout (as Cdp::timeout): recorded when a call has none.
     default: f64,
+    id: usize,
 }
 
 impl CdpConn for FakeConn {
@@ -609,6 +624,13 @@ impl CdpConn for FakeConn {
     }
     fn call(&mut self, method: &str, params: Value, session: Option<&str>, timeout: Option<f64>) -> Result<Value> {
         self.b.st().effective.push((method.to_string(), timeout.unwrap_or(self.default)));
+        let dead = {
+            let st = self.b.st();
+            (self.id < st.dead_before).then(|| st.dead_error.clone())
+        };
+        if let Some(msg) = dead {
+            return Err(Error::new(msg));
+        }
         self.b.dispatch(method, params, session, timeout)
     }
     fn set_default_timeout(&mut self, timeout: f64) {

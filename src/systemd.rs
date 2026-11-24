@@ -84,6 +84,18 @@ pub fn state_active(state: &str) -> Option<bool> {
     }
 }
 
+/// ActiveState says the unit runs (`active`, `reloading`, `refreshing`).
+pub fn is_running(state: &str) -> bool {
+    state_active(state) == Some(true)
+}
+
+/// ActiveState says the unit is stopped (`inactive`, `failed`) or on its way
+/// there (`deactivating`). Anything else, including an unknown state, may
+/// still run.
+pub fn stopping_or_stopped(state: &str) -> bool {
+    state == "deactivating" || state_active(state) == Some(false)
+}
+
 /// ActiveState of several units in one `systemctl show` (the Python runs
 /// `systemctl is-active` per unit). Cgroup and main pid are remembered for
 /// the ownership check later in this process. `None` for a unit means
