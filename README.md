@@ -125,7 +125,13 @@ sequence of blocking request/response steps with deadlines.
    (browser exited or restarted) looks the tab up afresh at once, and
    reconnects if it is still there; a stalled browser counts as busy for
    5 s first. With `--until-closed`, the tab going away is "closed" (0).
-   `--wait-viewer` alone ends (0) when the viewer disconnects.
+   `--wait-viewer` alone ends (0) when the viewer disconnects. The
+   show-then-wait handoff (`tab show TAB`, give the human the viewer
+   command, then `tab show TAB --until-url ...`) works: a waiting show takes
+   over a viewer that a show returning at once started (nobody else would
+   end it) and ends it. A viewer another waiting show owns is left to that
+   one; the last line then says so (`{"done": TAB, "reason": ...,
+   "still_shown": true}`) instead of `unshown`.
    `tab close` and the output gc stop a tab's viewer. `view` gained
    `--exit-on-disconnect`.
 

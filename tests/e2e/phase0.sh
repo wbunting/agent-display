@@ -363,6 +363,40 @@ wait
 check "window back during the wait: show goes on (exit 0)" bash -c "test $rc -eq 0 && test $(active_viewers) -eq 1"
 ad tab unshow "$A" >/dev/null
 
+echo "-- show, then show --until-url: the waiter takes the viewer over and ends the view"
+ad tab goto "$A" "http://127.0.0.1:$HP/handoff.html" >/dev/null
+run ad tab show "$A" --timeout 120
+timeout 60 python3 -I "$HERE/rfb.py" "unix:$SOCK" "$E2E_OUT/takeover-human.png" --hold 30 > "$E2E_OUT/takeover-rfb.out" 2>&1 &
+RP=$!
+sleep 1
+ad tab show "$A" --until-url '/home\.html' --timeout 60 > "$E2E_OUT/takeover.jsonl" &
+SP=$!
+sleep 2
+ad tab eval "$A" 'location.href = "/home.html?code=SECRET321"' >/dev/null
+wait "$SP"; src=$?
+wait "$RP"; rfbrc=$?
+cat "$E2E_OUT/takeover.jsonl" | cut -c1-140; echo "[waiter exit $src; human's viewer client exit $rfbrc: $(tail -1 "$E2E_OUT/takeover-rfb.out" | cut -c1-80)]"
+check "show-then-wait: exit 0, unshown url-matched" bash -c "test $src -eq 0 && grep -q '\"already_shown\": true' '$E2E_OUT/takeover.jsonl' && tail -1 '$E2E_OUT/takeover.jsonl' | grep -q '\"unshown\".*\"reason\": \"url-matched\"'"
+check "show-then-wait: the view really ended (viewer gone, human cut off)" bash -c "test $(active_viewers) -eq 0 && test $rfbrc -ne 0"
+
+echo "-- a viewer another waiting show owns: a second waiter leaves it up and says so"
+ad tab goto "$A" "http://127.0.0.1:$HP/handoff.html" >/dev/null
+ad tab show "$A" --wait-viewer --timeout 60 > "$E2E_OUT/owner.jsonl" &
+OP=$!
+for _ in $(seq 50); do [ -s "$E2E_OUT/owner.jsonl" ] && break; sleep 0.1; done
+ad tab show "$A" --until-url '/home\.html' --timeout 60 > "$E2E_OUT/second.jsonl" &
+SP=$!
+sleep 2
+ad tab eval "$A" 'location.href = "/home.html"' >/dev/null
+wait "$SP"; src=$?
+cat "$E2E_OUT/second.jsonl" | cut -c1-140; echo "[second waiter exit $src]"
+check "second waiter: exit 0, done url-matched still_shown" bash -c "test $src -eq 0 && tail -1 '$E2E_OUT/second.jsonl' | grep -q '\"done\".*\"reason\": \"url-matched\", \"still_shown\": true'"
+check "the owner's viewer is still up" test "$(active_viewers)" -eq 1 -a -S "$SOCK"
+run ad tab unshow "$A"
+wait "$OP"; orc=$?
+cat "$E2E_OUT/owner.jsonl" | tail -1; echo "[owner exit $orc]"
+check "the owner's wait ends when the viewer is unshown" bash -c "test $orc -eq 0 && test $(active_viewers) -eq 0"
+
 echo "-- two concurrent shows of one tab: one viewer, both see its options"
 ad tab show "$A" > "$E2E_OUT/c1.json" 2>&1 & C1=$!
 ad tab show "$A" > "$E2E_OUT/c2.json" 2>&1 & C2=$!

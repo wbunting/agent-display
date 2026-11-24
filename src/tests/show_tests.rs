@@ -34,6 +34,25 @@ fn ev(method: &str, clients: i64) -> VncEvent {
     VncEvent::Event(json!({"method": method, "params": {"id": "1", "connection_count": clients}}))
 }
 
+/// The running viewer of HEADLESS-2 is owned by another waiting `show`.
+fn owned_by_another_waiter(f: &Fx) {
+    let p = f.t.rt.join("agent-display/vnc/HEADLESS-2.json");
+    let mut st: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+    st["waiter"] = json!(true);
+    std::fs::write(&p, st.to_string()).unwrap();
+}
+
+/// wayvnc exits by itself shortly after its last client leaves
+/// (--exit-on-disconnect): its socket goes at the view end's settle pause.
+fn viewer_exits_on_settle(f: &Fx) {
+    let sock = f.t.rt.join("agent-display/vnc/HEADLESS-2.sock");
+    *f.sys.sleep_hook.borrow_mut() = Some(Box::new(move |secs| {
+        if secs == 0.1 {
+            let _ = std::fs::remove_file(&sock);
+        }
+    }));
+}
+
 fn stopped(f: &Fx) -> Vec<String> {
     f.sys.stopped.borrow().iter().flatten().cloned().collect()
 }
@@ -148,17 +167,25 @@ fn waiting_on_someone_elses_viewer_never_stops_it() {
     let f = fx();
     let (tab, _) = opened(&f);
     assert_eq!(f.cli(&["show", &tab]).0, 0);
-    // A second caller waits for the human, who leaves; the first caller's
-    // viewer exits by itself (--exit-on-disconnect), not by this show.
+    owned_by_another_waiter(&f);
+    // A second caller waits for the human, who leaves; the owner's viewer
+    // exits by itself (--exit-on-disconnect), not by this show.
+    viewer_exits_on_settle(&f);
     f.sys.vnc_script.borrow_mut().extend([ev("client-connected", 1), ev("client-disconnected", 0)]);
     let (code, out, _) = f.cli(&["show", "--wait-viewer", &tab]);
     assert_eq!(code, 0);
     assert_eq!(lines(&out).last().unwrap(), &json!({"unshown": tab, "reason": "disconnected"}));
     assert!(stopped(&f).is_empty(), "{:?}", stopped(&f));
-    // Its own --timeout ends its wait (3) and still leaves the viewer up.
+    // Again, with the owner's viewer up: this caller's own --timeout ends
+    // its wait (3), leaves the viewer up and says so.
+    *f.sys.sleep_hook.borrow_mut() = None;
+    assert_eq!(f.cli(&["unshow", &tab]).0, 0);
+    assert_eq!(f.cli(&["show", &tab]).0, 0);
+    owned_by_another_waiter(&f);
+    f.sys.stopped.borrow_mut().clear();
     let (code, out, _) = f.cli(&["show", "--wait-viewer", "--timeout", "0.05", &tab]);
     assert_eq!(code, 3);
-    assert_eq!(lines(&out).last().unwrap(), &json!({"unshown": tab, "reason": "timeout"}));
+    assert_eq!(lines(&out).last().unwrap(), &json!({"done": tab, "reason": "timeout", "still_shown": true}));
     assert!(stopped(&f).is_empty(), "{:?}", stopped(&f));
 }
 
@@ -455,7 +482,8 @@ fn until_waiter_never_stops_a_later_viewer_on_the_same_output() {
     f.sys.vnc_script.borrow_mut().extend([ev("client-connected", 1), ev("client-disconnected", 0), VncEvent::Closed]);
     let (code, out, err) = f.cli(&["show", "--until-url", "/home", "--timeout", "1.5", &tab]);
     assert_eq!(code, 3, "{err}");
-    assert_eq!(lines(&out).last().unwrap(), &json!({"unshown": tab, "reason": "timeout"}));
+    // The new viewer is up and not ours: said so, not "unshown".
+    assert_eq!(lines(&out).last().unwrap(), &json!({"done": tab, "reason": "timeout", "still_shown": true}));
     assert!(stopped(&f).is_empty(), "stopped someone else's viewer: {:?}", stopped(&f));
     assert!(std::fs::read_to_string(&state).unwrap().contains("othershow0000000"));
 }
@@ -569,14 +597,15 @@ fn until_url_on_a_reused_viewer_waits_its_own_timeout_not_the_viewers_expiry() {
 }
 
 #[test]
-fn wait_viewer_on_a_reused_viewer_still_ends_at_its_expiry() {
+fn wait_viewer_on_another_waiters_viewer_ends_at_its_expiry_and_leaves_it() {
     let f = fx();
     let (tab, _) = opened(&f);
     assert_eq!(f.cli(&["show", &tab]).0, 0);
+    owned_by_another_waiter(&f);
     set_expiry(&f, 0.05);
     let (code, out, _) = f.cli(&["show", "--wait-viewer", "--timeout", "60", &tab]);
     assert_eq!(code, 3);
-    assert_eq!(lines(&out).last().unwrap(), &json!({"unshown": tab, "reason": "timeout"}));
+    assert_eq!(lines(&out).last().unwrap(), &json!({"done": tab, "reason": "timeout", "still_shown": true}));
     assert!(stopped(&f).is_empty(), "not ours to stop");
 }
 
@@ -729,9 +758,10 @@ fn foreground_show_reports_a_failed_stop_and_keeps_the_files() {
     *f.sys.unknown_prefix.borrow_mut() = Some("agent-display-vnc-".into());
     *f.sys.stop_fail.borrow_mut() = true;
     let (code, out, err) = f.cli(&["show", "--wait-viewer", "--timeout", "0.05", &tab]);
-    // The view's outcome is still its outcome; the failed stop is on stderr.
+    // The view's outcome is still its outcome; the failed stop is on stderr
+    // and the last line says the viewer is still up.
     assert_eq!(code, 3, "{err}");
-    assert_eq!(lines(&out).last().unwrap(), &json!({"unshown": tab, "reason": "timeout"}));
+    assert_eq!(lines(&out).last().unwrap(), &json!({"done": tab, "reason": "timeout", "still_shown": true}));
     assert!(err.contains("could not stop the viewer agent-display-vnc-headless-2"), "{err}");
     assert!(err.contains(&format!("agent-display tab unshow {tab}")), "{err}");
     assert_eq!(vnc_files(&f), vec![true; 2]);
@@ -1036,4 +1066,115 @@ fn closed_stream_with_the_viewer_state_unknown_is_not_stopped() {
     assert_eq!(lines(&out).last().unwrap(), &json!({"unshown": tab, "reason": "timeout"}));
     // Ours, so the end still stops it (unknown is stopped, not skipped).
     assert_eq!(stopped(&f), vec!["agent-display-vnc-headless-2"]);
+}
+
+// ------------------------------------------------------------ round 9
+// show-then-wait: a waiting `show` takes over a viewer that a `show`
+// returning at once started (nobody else would end it), and ends it.
+
+fn state(f: &Fx) -> Value {
+    serde_json::from_str(&std::fs::read_to_string(f.t.rt.join("agent-display/vnc/HEADLESS-2.json")).unwrap()).unwrap()
+}
+
+#[test]
+fn state_records_whether_a_waiter_owns_the_viewer() {
+    let f = fx();
+    let (tab, _) = opened(&f);
+    assert_eq!(f.cli(&["show", &tab]).0, 0);
+    assert_eq!(state(&f)["waiter"], false, "returned at once: no waiter");
+    assert_eq!(f.cli(&["unshow", &tab]).0, 0);
+    // A waiting show records itself as the owner while it runs; check from
+    // inside the view (the first getTargetInfo poll).
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let s2 = seen.clone();
+    let p = f.t.rt.join("agent-display/vnc/HEADLESS-2.json");
+    let mut n = 0;
+    f.b.set_hook(move |m, _| {
+        if m == "Target.getTargetInfo" {
+            n += 1;
+            if n == 2 {
+                *s2.borrow_mut() = std::fs::read_to_string(&p).ok();
+            }
+        }
+        Hook::Pass
+    });
+    f.sys.vnc_script.borrow_mut().extend([ev("client-connected", 1)]);
+    assert_eq!(f.cli(&["show", "--wait-viewer", "--timeout", "0.05", &tab]).0, 3);
+    let st: Value = serde_json::from_str(seen.borrow().as_deref().unwrap()).unwrap();
+    assert_eq!(st["waiter"], true);
+}
+
+#[test]
+fn show_then_until_url_takes_the_viewer_over_and_ends_the_view() {
+    // The two-step handoff: `show` (returns at once, the agent hands the
+    // viewer command to the human), then `show --until-url` waits for the
+    // sign-in. When it lands, the view really ends.
+    let f = fx();
+    let (tab, _) = opened(&f);
+    let first = lines(&f.cli(&["show", &tab]).1)[0].clone();
+    f.b.st().targets.iter_mut().find(|(k, _)| *k == tab).unwrap().1["url"] = json!("https://bank.example/home");
+    f.sys.vnc_script.borrow_mut().extend([ev("client-connected", 1)]);
+    let (code, out, err) = f.cli(&["show", "--until-url", "/home", &tab]);
+    assert_eq!(code, 0, "{err}");
+    let l = lines(&out);
+    assert_eq!(l[0]["already_shown"], true);
+    assert_eq!(l[0]["socket"], first["socket"], "the same viewer");
+    assert_eq!(l.last().unwrap(), &json!({"unshown": tab, "reason": "url-matched"}));
+    assert_eq!(stopped(&f), vec!["agent-display-vnc-headless-2"]);
+    assert_eq!(vnc_files(&f), vec![false; 2]);
+    assert_eq!(viewer_runs(&f).len(), 1, "taken over, not restarted");
+}
+
+#[test]
+fn show_then_wait_viewer_takes_over_and_ends_at_its_timeout() {
+    let f = fx();
+    let (tab, _) = opened(&f);
+    assert_eq!(f.cli(&["show", &tab]).0, 0);
+    let (code, out, _) = f.cli(&["show", "--wait-viewer", "--timeout", "0.05", &tab]);
+    assert_eq!(code, 3);
+    assert_eq!(lines(&out).last().unwrap(), &json!({"unshown": tab, "reason": "timeout"}));
+    assert_eq!(stopped(&f), vec!["agent-display-vnc-headless-2"]);
+}
+
+#[test]
+fn a_viewer_another_waiter_owns_is_not_taken_over() {
+    let f = fx();
+    let (tab, _) = opened(&f);
+    assert_eq!(f.cli(&["show", &tab]).0, 0);
+    owned_by_another_waiter(&f);
+    let token = state(&f)["token"].clone();
+    f.b.st().targets.iter_mut().find(|(k, _)| *k == tab).unwrap().1["url"] = json!("https://bank.example/home");
+    let (code, out, err) = f.cli(&["show", "--until-url", "/home", &tab]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(lines(&out).last().unwrap(), &json!({"done": tab, "reason": "url-matched", "still_shown": true}));
+    assert!(stopped(&f).is_empty());
+    assert_eq!(state(&f)["token"], token);
+}
+
+#[test]
+fn a_takeover_is_recorded_so_no_second_waiter_takes_the_viewer() {
+    // While the waiter that took the viewer over runs, the state says a
+    // waiter owns it (a concurrent waiting show then leaves it alone).
+    let f = fx();
+    let (tab, _) = opened(&f);
+    assert_eq!(f.cli(&["show", &tab]).0, 0);
+    assert_eq!(state(&f)["waiter"], false);
+    let token = state(&f)["token"].clone();
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let s2 = seen.clone();
+    let p = f.t.rt.join("agent-display/vnc/HEADLESS-2.json");
+    let mut n = 0;
+    f.b.set_hook(move |m, _| {
+        if m == "Target.getTargetInfo" {
+            n += 1;
+            if n == 2 {
+                *s2.borrow_mut() = std::fs::read_to_string(&p).ok();
+            }
+        }
+        Hook::Pass
+    });
+    assert_eq!(f.cli(&["show", "--wait-viewer", "--timeout", "0.05", &tab]).0, 3);
+    let st: Value = serde_json::from_str(seen.borrow().as_deref().unwrap()).unwrap();
+    assert_eq!(st["waiter"], true);
+    assert_eq!(st["token"], token, "same viewer, same token");
 }

@@ -15,6 +15,10 @@
 //! actually runs and refuses to pretend a different mode. It also holds a
 //! random token: a `show` stops a viewer only while that file still holds
 //! the token it wrote, so it never stops a later viewer on the same output.
+//! And whether a waiting `show` owns the viewer: one started by a `show`
+//! that returned at once has no waiter, so the next waiting `show` takes it
+//! over (and ends it when its condition is met); one a waiter owns is left
+//! to that waiter, and the other caller's last line says it is still shown.
 
 use std::io::Read;
 use std::os::fd::AsRawFd;
@@ -37,6 +41,10 @@ const TAB_POLL: f64 = 0.5;
 /// WINDOW_WAIT_TRIES pauses of WINDOW_WAIT_STEP seconds (~2 s).
 const WINDOW_WAIT_TRIES: usize = 40;
 const WINDOW_WAIT_STEP: f64 = 0.05;
+/// How long a view's end waits for an exiting viewer to be gone before
+/// calling it still shown: SETTLE_TRIES pauses of SETTLE_STEP (~2 s).
+const SETTLE_TRIES: usize = 20;
+const SETTLE_STEP: f64 = 0.1;
 /// A tab poll that keeps timing out is "browser busy" until it has failed
 /// this long (seconds); then the tab is looked up afresh.
 const STALL_RECHECK: f64 = 5.0;
@@ -94,10 +102,40 @@ fn state_json(ctx: &Ctx, output: &str) -> Option<Value> {
     serde_json::from_str(&std::fs::read_to_string(viewer_state(ctx, output)).ok()?).ok()
 }
 
-/// The running viewer's options: (view_only, expires at, unix seconds).
-fn read_state(ctx: &Ctx, output: &str) -> Option<(bool, f64)> {
+/// What `vnc/HEADLESS-N.json` records about the running viewer.
+struct ViewerState {
+    view_only: bool,
+    /// When it expires (unix seconds).
+    expires: f64,
+    token: String,
+    /// A waiting `show` owns it (it will end the view).
+    waiter: bool,
+}
+
+fn read_state(ctx: &Ctx, output: &str) -> Option<ViewerState> {
     let v = state_json(ctx, output)?;
-    Some((v.get("view_only")?.as_bool()?, v.get("expires")?.as_f64()?))
+    Some(ViewerState {
+        view_only: v.get("view_only")?.as_bool()?,
+        expires: v.get("expires")?.as_f64()?,
+        token: v.get("token")?.as_str()?.to_string(),
+        // Not recorded: assume owned, never take it over.
+        waiter: v.get("waiter").and_then(Value::as_bool).unwrap_or(true),
+    })
+}
+
+fn write_state(ctx: &Ctx, output: &str, st: &ViewerState) -> Result<()> {
+    let record = json!({"view_only": st.view_only, "expires": st.expires, "token": st.token, "waiter": st.waiter});
+    write_private(&viewer_state(ctx, output), &json::dumps(&record, true))
+}
+
+/// A viewer may be up on `output`: its socket exists and systemd doesn't
+/// say it is stopping or stopped (an unknown state counts as up).
+fn viewer_up(ctx: &Ctx, output: &str) -> bool {
+    is_socket(&viewer_socket(ctx, output))
+        && !matches!(
+            ctx.sys.unit_active_state(ctx, &viewer_unit(output)).as_deref(),
+            Some("deactivating" | "inactive" | "failed")
+        )
 }
 
 /// The token of the viewer currently recorded for `output`.
@@ -337,21 +375,29 @@ pub fn cmd_tab_show(ctx: &Ctx, o: &TabOpts, tab: &str, s: &ShowOpts) -> Result<i
             .with_code(exit::TEMPFAIL));
         }
     };
-    // The token of the viewer this call starts (None: someone else's).
+    // The token of the viewer this call will end: one it starts, or one
+    // it takes over (None: another waiter owns the running viewer).
     let mut token: Option<String> = None;
     // When the view ends: ours from --timeout, or the running viewer's.
     let (view_only, expires) = if running {
-        let Some((view_only, expires)) = read_state(ctx, &output) else {
+        let Some(mut st) = read_state(ctx, &output) else {
             bail!("tab {tab} is already shown by a viewer with unknown options; `agent-display tab unshow {tab}` first");
         };
-        if view_only != s.view_only {
-            let (has, want) = if view_only { ("view-only", "interactive") } else { ("interactive", "view-only") };
+        if st.view_only != s.view_only {
+            let (has, want) = if st.view_only { ("view-only", "interactive") } else { ("interactive", "view-only") };
             bail!("tab {tab} is already shown {has}; `agent-display tab unshow {tab}` first to show it {want}");
         }
-        (view_only, expires)
+        if foreground && !st.waiter {
+            // Started by a `show` that returned at once: nobody else will
+            // end it. Take it over (under the lock: only one waiter does).
+            st.waiter = true;
+            write_state(ctx, &output, &st)?;
+            token = Some(st.token.clone());
+        }
+        (st.view_only, st.expires)
     } else {
         let expires = unix_now() + s.timeout; // before the launch: see VIEWER_GRACE
-        let t = start_viewer(ctx, &disp, &unit, &output, s.view_only, expires, &timeout_bin)?;
+        let t = start_viewer(ctx, &disp, &unit, &output, s.view_only, expires, foreground, &timeout_bin)?;
         token = Some(t);
         (s.view_only, expires)
     };
@@ -377,7 +423,7 @@ pub fn cmd_tab_show(ctx: &Ctx, o: &TabOpts, tab: &str, s: &ShowOpts) -> Result<i
     // (`follow`), so on someone else's viewer they wait our own --timeout.
     // On ours, `left` is our --timeout measured from before the launch.
     let until = until_url.is_some() || s.until_closed;
-    let wait = if until && token.is_none() { s.timeout } else { left.min(s.timeout) };
+    let wait = if until && running { s.timeout } else { left.min(s.timeout) };
     let deadline = Instant::now() + Duration::from_secs_f64(wait);
     let view = View { tab, output: &output, unit: &unit, token, deadline };
     follow(ctx, &view, s, until_url.as_ref(), events, found, o.port_raw)
@@ -385,7 +431,17 @@ pub fn cmd_tab_show(ctx: &Ctx, o: &TabOpts, tab: &str, s: &ShowOpts) -> Result<i
 
 /// Start a viewer for `output`; returns its token (see the module doc).
 /// Call with the output's ViewerLock held.
-fn start_viewer(ctx: &Ctx, disp: &Disp, unit: &str, output: &str, view_only: bool, expires: f64, timeout_bin: &str) -> Result<String> {
+#[allow(clippy::too_many_arguments)]
+fn start_viewer(
+    ctx: &Ctx,
+    disp: &Disp,
+    unit: &str,
+    output: &str,
+    view_only: bool,
+    expires: f64,
+    waiter: bool,
+    timeout_bin: &str,
+) -> Result<String> {
     ensure_vnc_dir(ctx)?;
     let (sock, ctl, state) = (viewer_socket(ctx, output), viewer_control(ctx, output), viewer_state(ctx, output));
     for f in [&sock, &ctl, &state] {
@@ -416,8 +472,7 @@ fn start_viewer(ctx: &Ctx, disp: &Disp, unit: &str, output: &str, view_only: boo
     // couldn't start before), so it can't remove this. The ViewerLock keeps
     // every other `show` (the only reader of the options) out until then.
     let token = hex(&random_bytes(8));
-    let record = json::dumps(&json!({"view_only": view_only, "expires": expires, "token": token}), true);
-    if let Err(e) = write_private(&state, &record) {
+    if let Err(e) = write_state(ctx, output, &ViewerState { view_only, expires, token: token.clone(), waiter }) {
         let _ = ctx.sys.stop_units(ctx, &[unit.to_string()]);
         return Err(e);
     }
@@ -429,9 +484,10 @@ struct View<'a> {
     tab: &'a str,
     output: &'a str,
     unit: &'a str,
-    /// Token of the viewer this invocation started (None: someone else's).
-    /// Once ours exits, a later `show` records a new token, so a waiter that
-    /// outlives its viewer (--until-*) can't stop the next one.
+    /// Token of the viewer this invocation ends: one it started or took over
+    /// (None: another waiter's). Once ours exits, a later `show` records a
+    /// new token, so a waiter that outlives its viewer (--until-*) can't stop
+    /// the next one.
     token: Option<String>,
     deadline: Instant,
 }
@@ -481,9 +537,26 @@ fn follow(
     // The viewer has exited; only the tab is watched (until mode).
     let mut viewer_gone = false;
     let mut next_poll = Instant::now();
+    // The view ends: stop our viewer, then say whether the tab is still
+    // shown (someone else's viewer, or ours could not be stopped). After a
+    // disconnect or stop the viewer is exiting: give it a moment first.
     let end = |reason: &str, code: i32| -> Result<i32> {
         v.stop_own(ctx);
-        emit(ctx, vec![("unshown", tab.into()), ("reason", reason.into())]);
+        let mut up = viewer_up(ctx, v.output);
+        if matches!(reason, "disconnected" | "stopped") {
+            for _ in 0..SETTLE_TRIES {
+                if !up {
+                    break;
+                }
+                ctx.sys.sleep(SETTLE_STEP);
+                up = viewer_up(ctx, v.output);
+            }
+        }
+        if up {
+            emit(ctx, vec![("done", tab.into()), ("reason", reason.into()), ("still_shown", true.into())]);
+        } else {
+            emit(ctx, vec![("unshown", tab.into()), ("reason", reason.into())]);
+        }
         Ok(code)
     };
     // The tab is gone for good: why, and how this view ends.

@@ -1041,6 +1041,8 @@ mod tests {
         assert!(show.starts_with("usage: agent-display tab show [-h] [--port PORT] [--timeout SECONDS]\n"));
         assert!(show.contains("  --until-url REGEX  end the view once the tab's URL matches REGEX"));
         assert!(h("tab|unshow|-h").starts_with("usage: agent-display tab unshow [-h] tab\n"));
+        assert!(h("tab|unshow|-h").contains("75 if\nthe viewer could not be stopped (try again)"));
+        assert!(show.contains("{\"done\": TAB, \"reason\": ..., \"still_shown\": true}"));
         assert!(h("view|-h").contains("  --exit-on-disconnect  stop the viewer when the last client disconnects\n"));
         // Usage errors print the subcommand's own usage.
         assert!(p("tab|show").unwrap_err().stderr.starts_with("usage: agent-display tab show [-h] [--port PORT]"));
