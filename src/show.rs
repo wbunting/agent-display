@@ -28,7 +28,7 @@ use crate::cli::{ShowOpts, TabOpts};
 use crate::ctx::*;
 use crate::display::{Wayvnc, display, start_wayvnc, wayvnc_argv};
 use crate::tab::{GONE_RECHECK, lookup, marked_outputs, no_such_target, output_windows, tab_alive, valid_tab_id};
-use crate::util::{Error, Result, exit, fmt_g, hex, is_socket, py_repr, random_bytes, unlink_missing_ok, which, write_private};
+use crate::util::{Error, FileLock, Result, exit, fmt_g, hex, is_socket, py_repr, random_bytes, unlink_missing_ok, which, write_private};
 use crate::{bail, json};
 
 /// How often a foreground `show` checks the tab (URL, still open).
@@ -73,31 +73,13 @@ fn ensure_vnc_dir(ctx: &Ctx) -> Result<()> {
 /// decides whether a viewer runs and starts one: two concurrent shows of
 /// one tab must not both start (and unlink each other's socket and state).
 struct ViewerLock {
-    _file: std::fs::File,
+    _lock: FileLock,
 }
 
 impl ViewerLock {
     fn acquire(ctx: &Ctx, output: &str) -> Result<ViewerLock> {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::fs::OpenOptionsExt;
         ensure_vnc_dir(ctx)?;
-        let f = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(ctx.vnc_dir().join(format!("{output}.lock")))?;
-        loop {
-            // SAFETY: flock on a fd we own.
-            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0 {
-                return Ok(ViewerLock { _file: f });
-            }
-            let e = std::io::Error::last_os_error();
-            if e.kind() != std::io::ErrorKind::Interrupted {
-                return Err(e.into());
-            }
-        }
+        Ok(ViewerLock { _lock: FileLock::acquire(&ctx.vnc_dir().join(format!("{output}.lock")))? })
     }
 }
 
@@ -341,12 +323,6 @@ fn start_viewer(ctx: &Ctx, disp: &Disp, unit: &str, output: &str, view_only: boo
     for f in [&sock, &ctl, &state] {
         unlink_missing_ok(f);
     }
-    // The state goes first: once the socket exists, a `show` that finds the
-    // viewer running must also find its options. It is written again once
-    // wayvnc runs (below).
-    let token = hex(&random_bytes(8));
-    let record = json::dumps(&json!({"view_only": view_only, "expires": expires, "token": token}), true);
-    write_private(&state, &record)?;
     // wayvnc dies VIEWER_GRACE after the view's deadline at the latest.
     let kill_in = (expires - unix_now()).max(0.0) + VIEWER_GRACE;
     let prefix = [timeout_bin.to_string(), "--kill-after=5".into(), fmt_g(kill_in.ceil())];
@@ -367,12 +343,16 @@ fn start_viewer(ctx: &Ctx, disp: &Disp, unit: &str, output: &str, view_only: boo
         }
         return Err(Error::new(format!("{output}: {}", e.msg)).with_code(e.code));
     }
-    // If the previous viewer's unit was still stopping, start_wayvnc waited
-    // for it, and its ExecStopPost (`rm -f sock ctl state`) may have removed
-    // the state written above. Its stop has finished by now (the new unit
-    // couldn't start before), so write it again; the ViewerLock keeps other
-    // shows from reading it in between.
-    write_private(&state, &record)?;
+    // Only now: if the previous viewer's unit was still stopping, its
+    // ExecStopPost (`rm -f sock ctl state`) has finished (the new unit
+    // couldn't start before), so it can't remove this. The ViewerLock keeps
+    // every other `show` (the only reader of the options) out until then.
+    let token = hex(&random_bytes(8));
+    let record = json::dumps(&json!({"view_only": view_only, "expires": expires, "token": token}), true);
+    if let Err(e) = write_private(&state, &record) {
+        let _ = ctx.sys.stop_units(ctx, &[unit.to_string()]);
+        return Err(e);
+    }
     Ok(token)
 }
 

@@ -345,6 +345,29 @@ pub fn hex(data: &[u8]) -> String {
 // ------------------------------------------------------------ files
 
 /// Write a 0600 file (created or truncated), like the Python's write_private.
+/// An exclusive `flock` on `path` (created 0600 if missing), held until
+/// dropped. Blocks until it is free; retries on EINTR.
+pub struct FileLock {
+    _file: std::fs::File,
+}
+
+impl FileLock {
+    pub fn acquire(path: &Path) -> Result<FileLock> {
+        use std::os::fd::AsRawFd;
+        let f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600).open(path)?;
+        loop {
+            // SAFETY: flock on a fd we own.
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return Ok(FileLock { _file: f });
+            }
+            let e = io::Error::last_os_error();
+            if e.kind() != io::ErrorKind::Interrupted {
+                return Err(e.into());
+            }
+        }
+    }
+}
+
 pub fn write_private(path: &Path, text: &str) -> Result<()> {
     let mut f = std::fs::OpenOptions::new()
         .write(true)

@@ -588,14 +588,20 @@ fn wait_viewer_on_a_reused_viewer_still_ends_at_its_expiry() {
 }
 
 #[test]
-fn viewer_state_exists_before_wayvnc_and_the_start_is_locked() {
-    // A concurrent show that finds the socket must also find the options,
-    // and two shows of one tab can't both start a viewer.
+fn viewer_start_is_locked_and_its_state_written_once_it_runs() {
+    // Concurrent shows of one tab are serialised by vnc/HEADLESS-N.lock, so
+    // the options can be written after wayvnc starts (when a previous
+    // viewer's ExecStopPost can no longer remove them): no other `show` can
+    // look in between.
     let f = fx();
     let (tab, _) = opened(&f);
     assert_eq!(f.cli(&["show", &tab]).0, 0);
-    assert_eq!(*f.sys.viewer_start_seen.borrow(), vec![(true, true)]);
-    // Released afterwards: a later show isn't blocked.
+    // At systemd-run: lock held, state not written yet (old files cleared).
+    assert_eq!(*f.sys.viewer_start_seen.borrow(), vec![(false, true)]);
+    let st: Value =
+        serde_json::from_str(&std::fs::read_to_string(f.t.rt.join("agent-display/vnc/HEADLESS-2.json")).unwrap()).unwrap();
+    assert_eq!(st["token"].as_str().unwrap().len(), 16);
+    // Released afterwards: later shows aren't blocked.
     assert_eq!(f.cli(&["show", &tab]).0, 0);
     assert_eq!(f.cli(&["unshow", &tab]).0, 0);
     assert_eq!(f.cli(&["show", "--view-only", &tab]).0, 0);

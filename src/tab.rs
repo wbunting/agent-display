@@ -22,7 +22,6 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -34,7 +33,7 @@ use crate::cdp::CdpConn;
 use crate::cli::TabOpts;
 use crate::ctx::*;
 use crate::display::{display, ensure_runtime_dir, walk, windows};
-use crate::util::{Error, Result, absolute, b64decode, exit, fmt_g, hex, py_repr, random_bytes, unlink_missing_ok, write_private};
+use crate::util::{Error, FileLock, Result, absolute, b64decode, exit, fmt_g, hex, py_repr, random_bytes, unlink_missing_ok, write_private};
 use crate::{bail, json};
 
 /// `/json/list` timeout. Raised with the ownership check (5 s in the
@@ -531,28 +530,14 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
 
 /// Serialises creating, placing and removing tab outputs across agents
 /// (and across the Python and Rust tools: same file, same flock).
-pub struct OutputsLock { _file: std::fs::File }
+pub struct OutputsLock {
+    _lock: FileLock,
+}
 
 impl OutputsLock {
     pub fn acquire(ctx: &Ctx) -> Result<OutputsLock> {
         ensure_runtime_dir(ctx)?;
-        let f = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(ctx.runtime_dir().join("tab-outputs.lock"))?;
-        loop {
-            // SAFETY: flock on a fd we own.
-            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0 {
-                return Ok(OutputsLock { _file: f });
-            }
-            let e = std::io::Error::last_os_error();
-            if e.kind() != std::io::ErrorKind::Interrupted {
-                return Err(e.into());
-            }
-        }
+        Ok(OutputsLock { _lock: FileLock::acquire(&ctx.runtime_dir().join("tab-outputs.lock"))? })
     }
 }
 

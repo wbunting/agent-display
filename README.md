@@ -99,8 +99,8 @@ sequence of blocking request/response steps with deadlines.
    file holds a random token; a `show` stops a viewer only while the file
    still holds the token it wrote). Re-showing right after a viewer exited
    waits out its still-stopping unit. Concurrent shows of one tab are
-   serialised (`vnc/HEADLESS-N.lock`): one starts the viewer, the others
-   reuse it. On someone else's viewer, `--wait-viewer` ends by its expiry
+   serialised (`vnc/HEADLESS-N.lock`): one starts the viewer and writes its
+   state once wayvnc runs, the others reuse it. On someone else's viewer, `--wait-viewer` ends by its expiry
    at the latest; `--until-*` wait their own `--timeout`.
    `--wait-viewer`, `--until-url REGEX` and `--until-closed` keep it in the
    foreground, printing `{"viewer": "connected"}` / `"disconnected"` JSON
