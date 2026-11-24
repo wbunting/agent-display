@@ -150,6 +150,9 @@ pub struct FakeSys {
     /// Really sleep min(secs, cap) too (loops paced by sleep against a
     /// real deadline); default: sleeps are only recorded.
     pub real_sleep_cap: Option<f64>,
+    /// For each viewer start: (its state file existed, its output's
+    /// ViewerLock was held) when systemd_run ran.
+    pub viewer_start_seen: RefCell<Vec<(bool, bool)>>,
     /// Unix sockets "wayvnc" made (systemd_run of a --unix-socket argv).
     pub sockets: RefCell<Vec<std::os::unix::net::UnixListener>>,
 }
@@ -200,6 +203,17 @@ impl Sys for FakeSys {
         self.systemd_runs.borrow_mut().push(v);
         // A started wayvnc makes its Unix socket.
         if let Some(i) = argv.iter().position(|a| a == "--unix-socket") {
+            let sock = Path::new(&argv[i + 1]);
+            let state = sock.with_extension("json");
+            let lock = std::fs::File::open(sock.with_extension("lock")).ok();
+            // flock conflicts between open file descriptions, even in one
+            // process: LOCK_NB fails while `show` holds the lock.
+            let held = lock.is_some_and(|f| {
+                use std::os::fd::AsRawFd;
+                // SAFETY: flock on a fd we own (closed on drop, releasing it).
+                unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) != 0 }
+            });
+            self.viewer_start_seen.borrow_mut().push((state.exists(), held));
             let l = std::os::unix::net::UnixListener::bind(&argv[i + 1]).unwrap();
             self.sockets.borrow_mut().push(l);
         }

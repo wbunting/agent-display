@@ -59,6 +59,48 @@ fn unix_now() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
 }
 
+/// Create the 0700 vnc/ dir in the runtime dir.
+fn ensure_vnc_dir(ctx: &Ctx) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    match std::fs::DirBuilder::new().mode(0o700).create(ctx.vnc_dir()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Exclusive per-output lock (`vnc/HEADLESS-N.lock`), held while a `show`
+/// decides whether a viewer runs and starts one: two concurrent shows of
+/// one tab must not both start (and unlink each other's socket and state).
+struct ViewerLock {
+    _file: std::fs::File,
+}
+
+impl ViewerLock {
+    fn acquire(ctx: &Ctx, output: &str) -> Result<ViewerLock> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        ensure_vnc_dir(ctx)?;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(ctx.vnc_dir().join(format!("{output}.lock")))?;
+        loop {
+            // SAFETY: flock on a fd we own.
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return Ok(ViewerLock { _file: f });
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                return Err(e.into());
+            }
+        }
+    }
+}
+
 fn state_json(ctx: &Ctx, output: &str) -> Option<Value> {
     serde_json::from_str(&std::fs::read_to_string(viewer_state(ctx, output)).ok()?).ok()
 }
@@ -242,6 +284,8 @@ pub fn cmd_tab_show(ctx: &Ctx, o: &TabOpts, tab: &str, s: &ShowOpts) -> Result<i
     }
     let unit = viewer_unit(&output);
     let sock = viewer_socket(ctx, &output);
+    // Released when the decision and any start are done (before following).
+    let lock = ViewerLock::acquire(ctx, &output)?;
     let running = ctx.sys.unit_active(ctx, &unit) && is_socket(&sock);
     // The token of the viewer this call starts (None: someone else's).
     let mut token: Option<String> = None;
@@ -261,6 +305,7 @@ pub fn cmd_tab_show(ctx: &Ctx, o: &TabOpts, tab: &str, s: &ShowOpts) -> Result<i
         token = Some(t);
         (s.view_only, expires)
     };
+    drop(lock);
     let left = (expires - unix_now()).max(0.0);
     let sock_s = sock.to_string_lossy().into_owned();
     emit(ctx, vec![
@@ -277,25 +322,29 @@ pub fn cmd_tab_show(ctx: &Ctx, o: &TabOpts, tab: &str, s: &ShowOpts) -> Result<i
         return Ok(0);
     }
     let events = ctx.sys.vnc_events(ctx, &viewer_control(ctx, &output))?;
-    // Waiting on someone else's viewer: our own --timeout may end the wait
-    // earlier, but only the caller that started a viewer stops it.
-    let deadline = Instant::now() + Duration::from_secs_f64(left.min(s.timeout));
+    // --wait-viewer alone follows the viewer, so its wait ends when the
+    // viewer expires at the latest. --until-* watch the tab past the viewer
+    // (`follow`), so on someone else's viewer they wait our own --timeout.
+    // On ours, `left` is our --timeout measured from before the launch.
+    let until = until_url.is_some() || s.until_closed;
+    let wait = if until && token.is_none() { s.timeout } else { left.min(s.timeout) };
+    let deadline = Instant::now() + Duration::from_secs_f64(wait);
     let view = View { tab, output: &output, unit: &unit, token, deadline };
     follow(ctx, &view, s, until_url.as_ref(), events, found.cdp.as_mut())
 }
 
 /// Start a viewer for `output`; returns its token (see the module doc).
+/// Call with the output's ViewerLock held.
 fn start_viewer(ctx: &Ctx, disp: &Disp, unit: &str, output: &str, view_only: bool, expires: f64, timeout_bin: &str) -> Result<String> {
-    use std::os::unix::fs::DirBuilderExt;
-    match std::fs::DirBuilder::new().mode(0o700).create(ctx.vnc_dir()) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(e.into()),
-    }
+    ensure_vnc_dir(ctx)?;
     let (sock, ctl, state) = (viewer_socket(ctx, output), viewer_control(ctx, output), viewer_state(ctx, output));
     for f in [&sock, &ctl, &state] {
         unlink_missing_ok(f);
     }
+    // The state goes first: once the socket exists, a `show` that finds the
+    // viewer running must also find its options.
+    let token = hex(&random_bytes(8));
+    write_private(&state, &json::dumps(&json!({"view_only": view_only, "expires": expires, "token": token}), true))?;
     // wayvnc dies VIEWER_GRACE after the view's deadline at the latest.
     let kill_in = (expires - unix_now()).max(0.0) + VIEWER_GRACE;
     let prefix = [timeout_bin.to_string(), "--kill-after=5".into(), fmt_g(kill_in.ceil())];
@@ -316,8 +365,6 @@ fn start_viewer(ctx: &Ctx, disp: &Disp, unit: &str, output: &str, view_only: boo
         }
         return Err(Error::new(format!("{output}: {}", e.msg)).with_code(e.code));
     }
-    let token = hex(&random_bytes(8));
-    write_private(&state, &json::dumps(&json!({"view_only": view_only, "expires": expires, "token": token}), true))?;
     Ok(token)
 }
 

@@ -536,3 +536,81 @@ fn reshow_never_stops_a_viewer_another_call_just_started() {
     assert!(err.contains("was just started by another call; try again"), "{err}");
     assert!(stopped(&f).is_empty(), "{:?}", stopped(&f));
 }
+
+// ------------------------------------------------------------ round 3
+
+fn set_expiry(f: &Fx, secs_from_now: f64) {
+    let p = f.t.rt.join("agent-display/vnc/HEADLESS-2.json");
+    let mut st: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+    st["expires"] = json!(now + secs_from_now);
+    std::fs::write(&p, st.to_string()).unwrap();
+}
+
+#[test]
+fn until_url_on_a_reused_viewer_waits_its_own_timeout_not_the_viewers_expiry() {
+    // Another caller's viewer has 0.3 s left; this call asks --until-url
+    // with --timeout 5. The viewer expires, the sign-in lands at ~0.6 s:
+    // exit 0, not a timeout at the other viewer's expiry.
+    let mut f = fx();
+    f.sys.real_sleep_cap = Some(0.01);
+    let (tab, _) = opened(&f);
+    assert_eq!(f.cli(&["show", &tab]).0, 0);
+    set_expiry(&f, 0.3);
+    let start = std::time::Instant::now();
+    let t2 = tab.clone();
+    f.b.set_hook(move |m, _| {
+        if m == "Target.getTargetInfo" && start.elapsed().as_secs_f64() > 0.6 {
+            return Hook::Return(Ok(json!({"targetInfo": {"targetId": t2, "type": "page",
+                "url": "https://bank.example/home", "title": ""}})));
+        }
+        Hook::Pass
+    });
+    f.sys.vnc_script.borrow_mut().extend([ev("client-connected", 1), ev("client-disconnected", 0), VncEvent::Closed]);
+    let (code, out, err) = f.cli(&["show", "--until-url", "/home", "--timeout", "5", &tab]);
+    assert_eq!(code, 0, "{err}");
+    let l = lines(&out);
+    assert_eq!(l[0]["already_shown"], true);
+    assert_eq!(l.last().unwrap(), &json!({"unshown": tab, "reason": "url-matched"}));
+    assert!(start.elapsed().as_secs_f64() > 0.6);
+}
+
+#[test]
+fn wait_viewer_on_a_reused_viewer_still_ends_at_its_expiry() {
+    let f = fx();
+    let (tab, _) = opened(&f);
+    assert_eq!(f.cli(&["show", &tab]).0, 0);
+    set_expiry(&f, 0.05);
+    let (code, out, _) = f.cli(&["show", "--wait-viewer", "--timeout", "60", &tab]);
+    assert_eq!(code, 3);
+    assert_eq!(lines(&out).last().unwrap(), &json!({"unshown": tab, "reason": "timeout"}));
+    assert!(stopped(&f).is_empty(), "not ours to stop");
+}
+
+#[test]
+fn viewer_state_exists_before_wayvnc_and_the_start_is_locked() {
+    // A concurrent show that finds the socket must also find the options,
+    // and two shows of one tab can't both start a viewer.
+    let f = fx();
+    let (tab, _) = opened(&f);
+    assert_eq!(f.cli(&["show", &tab]).0, 0);
+    assert_eq!(*f.sys.viewer_start_seen.borrow(), vec![(true, true)]);
+    // Released afterwards: a later show isn't blocked.
+    assert_eq!(f.cli(&["show", &tab]).0, 0);
+    assert_eq!(f.cli(&["unshow", &tab]).0, 0);
+    assert_eq!(f.cli(&["show", "--view-only", &tab]).0, 0);
+    assert_eq!(f.sys.viewer_start_seen.borrow().len(), 2);
+}
+
+#[test]
+fn failed_start_leaves_no_state_behind() {
+    let f = fx();
+    let (tab, _) = opened(&f);
+    // systemd-run keeps refusing (still loaded) and the unit never becomes
+    // active: the start fails and its early state file is removed.
+    *f.sys.run_still_loaded.borrow_mut() = 100;
+    let (code, _, err) = f.cli(&["show", &tab]);
+    assert_ne!(code, 0, "{err}");
+    assert!(!f.t.rt.join("agent-display/vnc/HEADLESS-2.json").exists());
+    assert!(!f.t.rt.join("agent-display/vnc/HEADLESS-2.sock").exists());
+}

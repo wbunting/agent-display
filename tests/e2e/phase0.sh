@@ -291,6 +291,29 @@ check "a human can still connect to it" test "$rc" -eq 0
 sleep 1
 check "and it exits after that human leaves" test "$(active_viewers)" -eq 0
 
+echo "-- two concurrent shows of one tab: one viewer, both see its options"
+ad tab show "$A" > "$E2E_OUT/c1.json" 2>&1 & C1=$!
+ad tab show "$A" > "$E2E_OUT/c2.json" 2>&1 & C2=$!
+wait "$C1"; r1=$?; wait "$C2"; r2=$?
+cat "$E2E_OUT/c1.json" "$E2E_OUT/c2.json" | cut -c1-120; echo "[exits $r1 $r2]"
+check "concurrent shows: both exit 0" test "$r1" -eq 0 -a "$r2" -eq 0
+check "concurrent shows: exactly one started it" test "$(cat "$E2E_OUT/c1.json" "$E2E_OUT/c2.json" | jq -s 'map(select(.already_shown == false)) | length')" -eq 1
+check "concurrent shows: one viewer running, socket in place" test "$(active_viewers)" -eq 1 -a -S "$SOCK"
+run ad tab unshow "$A"
+
+echo "-- --until-url on someone else's viewer that expires first: waits its own --timeout"
+ad tab goto "$A" "http://127.0.0.1:$HP/handoff.html" >/dev/null
+run ad tab show "$A" --timeout 3
+ad tab show "$A" --until-url '/home\.html' --timeout 30 > "$E2E_OUT/show7.jsonl" &
+SP=$!
+sleep 7   # the other viewer expired (3 s + 2 s grace) and is gone
+check "other viewer expired" test "$(active_viewers)" -eq 0
+check "until-url still waiting past the other viewer's expiry" kill -0 "$SP"
+ad tab eval "$A" 'location.href = "/home.html?code=SECRET789"' >/dev/null
+wait "$SP"; src=$?
+cat "$E2E_OUT/show7.jsonl" | cut -c1-160; echo "[exit $src]"
+check "reused viewer + until-url met after its expiry: exit 0, url-matched" bash -c "test $src -eq 0 && grep -q '\"already_shown\": true' '$E2E_OUT/show7.jsonl' && grep -q '\"reason\": \"url-matched\"' '$E2E_OUT/show7.jsonl'"
+
 echo "-- show --timeout while a human is still connected: exit 3, viewer stopped"
 s=$SECONDS
 ad tab show "$A" --wait-viewer --timeout 4 > "$E2E_OUT/show3.jsonl" &
