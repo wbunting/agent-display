@@ -908,3 +908,69 @@ both!(explicit_port_refusal_is_still_1_and_not_retried, |f: Fx| {
     assert!(f.sys.sleeps.borrow().is_empty());
     assert!(f.calls().is_empty());
 });
+
+// ------------------------------------------------------------ closeTarget "no such target"
+
+fn close_says_no_target() -> Hook {
+    Hook::Return(Err(Error::new("Target.closeTarget: No target with given id found")))
+}
+
+both!(close_whose_earlier_attempt_went_through_late_is_closed, |f: Fx| {
+    // Attempt 1 times out while Chromium still tears the tab down; attempt
+    // 2's lookup still finds it, and its closeTarget says "no such target":
+    // our first close did it. Exit 0, output removed.
+    let opened = f.open(&[]);
+    let tab = opened["tab"].as_str().unwrap().to_string();
+    let mut n = 0;
+    let sway = f.sway.clone();
+    let t2 = tab.clone();
+    f.b.set_hook(move |m, _| {
+        if m == "Target.closeTarget" {
+            n += 1;
+            if n == 1 {
+                return Hook::Return(Err(timed_out_close()));
+            }
+            // By now the first close has finished: the window is gone.
+            if let Some(s) = &sway {
+                s.closed(&t2);
+            }
+            return close_says_no_target();
+        }
+        Hook::Pass
+    });
+    let (code, out, err) = f.cli(&["close", &tab]);
+    assert_eq!(code, 0, "{err}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["closed"], tab.as_str());
+    assert_eq!(close_calls(&f), 2);
+    if f.sway.is_some() {
+        assert_eq!(v["output"], opened["output"]);
+        assert!(f.markers().is_empty());
+    }
+});
+
+both!(close_of_a_tab_closed_by_someone_else_meanwhile_is_gone, |f: Fx| {
+    // Found by the lookup, closed by another caller before our closeTarget.
+    let opened = f.open(&[]);
+    let tab = opened["tab"].as_str().unwrap().to_string();
+    let sway = f.sway.clone();
+    let t2 = tab.clone();
+    f.b.set_hook(move |m, _| {
+        if m == "Target.closeTarget" {
+            if let Some(s) = &sway {
+                s.closed(&t2); // its window went with it
+            }
+            return close_says_no_target();
+        }
+        Hook::Pass
+    });
+    let (code, out, err) = f.cli(&["close", &tab]);
+    assert_eq!((code, out.as_str()), (4, ""), "{err}");
+    assert!(err.contains("it was closed just before this close"), "{err}");
+    assert_eq!(close_calls(&f), 1);
+    assert!(f.sys.sleeps.borrow().iter().all(|s| *s < 1.0), "not retried");
+    if f.sway.is_some() {
+        assert!(f.markers().is_empty(), "its output was removed");
+        assert!(!f.sw().st().outputs.contains(&opened["output"].as_str().unwrap().to_string()));
+    }
+});

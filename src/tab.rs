@@ -903,8 +903,10 @@ fn unit_for_port(ctx: &Ctx, port: u16) -> Option<String> {
 /// stall for seconds, and a failed close used to leave the tab open.
 /// Retries only while the tab's browser unit is still active, so a stopped
 /// browser fails at once (exit 5). If an earlier attempt sent closeTarget
-/// and the tab is now confirmed gone, that attempt closed it. A close that
-/// keeps stalling exits 75; a tab that was already gone exits 4.
+/// and the tab is now confirmed gone (by the lookup, or by closeTarget
+/// itself answering "no such target"), that attempt closed it. A close that
+/// keeps stalling exits 75; a tab that was already gone (closed by someone
+/// else between the lookup and closeTarget) exits 4, its output removed.
 pub fn cmd_tab_close(ctx: &Ctx, o: &TabOpts, tab: &str) -> Result<i32> {
     let mut sent_on: Option<u16> = None;
     let mut attempt = 0;
@@ -921,6 +923,17 @@ pub fn cmd_tab_close(ctx: &Ctx, o: &TabOpts, tab: &str) -> Result<i32> {
         match r {
             Ok(ok) if ok.get("success") == Some(&Value::Bool(false)) => bail!("could not close {tab}"),
             Ok(_) => break found.port,
+            // An earlier closeTarget of ours went through late: closed.
+            Err(e) if no_such_target(&e) && attempt > 1 => break found.port,
+            // Closed by someone else since our lookup found it.
+            Err(e) if no_such_target(&e) => {
+                remove_tab_output(ctx, tab, 5.0);
+                return Err(Error::new(format!(
+                    "no tab {tab} in an agent-display browser: it was closed just before this close ({})",
+                    e.msg
+                ))
+                .with_code(exit::GONE));
+            }
             Err(e) if !retryable(&e) => return Err(e),
             Err(e) => {
                 let unit = unit_for_port(ctx, found.port);

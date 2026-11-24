@@ -344,7 +344,6 @@ pub fn hex(data: &[u8]) -> String {
 
 // ------------------------------------------------------------ files
 
-/// Write a 0600 file (created or truncated), like the Python's write_private.
 /// An exclusive `flock` on `path` (created 0600 if missing), held until
 /// dropped. Blocks until it is free; retries on EINTR.
 pub struct FileLock {
@@ -368,6 +367,7 @@ impl FileLock {
     }
 }
 
+/// Write a 0600 file (created or truncated), like the Python's write_private.
 pub fn write_private(path: &Path, text: &str) -> Result<()> {
     let mut f = std::fs::OpenOptions::new()
         .write(true)
