@@ -74,11 +74,6 @@ pub fn cgroup_pids(dir: &Path) -> Vec<u32> {
     pids
 }
 
-/// Does `pid` hold an fd for one of `inodes`?
-pub fn pid_has_socket(pid: u32, inodes: &HashSet<u64>) -> bool {
-    pid_socket(pid, inodes).is_some()
-}
-
 /// The first of `inodes` that `pid` holds an fd for.
 pub fn pid_socket(pid: u32, inodes: &HashSet<u64>) -> Option<u64> {
     let rd = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
@@ -273,8 +268,8 @@ mod tests {
         let port = l.local_addr().unwrap().port();
         let inodes = listen_inodes(port);
         assert_eq!(inodes.len(), 1);
-        assert!(pid_has_socket(std::process::id(), &inodes));
-        assert!(!pid_has_socket(1, &inodes));
+        assert!(pid_socket(std::process::id(), &inodes).is_some());
+        assert!(pid_socket(1, &inodes).is_none());
     }
 
     #[test]

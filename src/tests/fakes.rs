@@ -104,6 +104,7 @@ type ListenerFn = Box<dyn Fn(u16, &str) -> bool>;
 type UnitFn = Box<dyn Fn(&str) -> bool>;
 type HookFn = Box<dyn FnMut(&str, &Value) -> Hook>;
 type OwnerFn = Box<dyn Fn(&Owner) -> bool>;
+type SleepHook = Box<dyn FnMut(f64)>;
 
 /// `None` fields fall back to inert defaults (nothing active, no
 /// listener), never to the real system.
@@ -147,6 +148,8 @@ pub struct FakeSys {
     /// The next N systemd_run calls fail like systemd-run for a transient
     /// unit that is still loaded (a viewer still running ExecStopPost).
     pub run_still_loaded: RefCell<usize>,
+    /// Called on every sleep (to change the world between polls).
+    pub sleep_hook: RefCell<Option<SleepHook>>,
     /// Really sleep min(secs, cap) too (loops paced by sleep against a
     /// real deadline); default: sleeps are only recorded.
     pub real_sleep_cap: Option<f64>,
@@ -379,6 +382,9 @@ impl Sys for FakeSys {
     }
     fn sleep(&self, secs: f64) {
         self.sleeps.borrow_mut().push(secs);
+        if let Some(h) = self.sleep_hook.borrow_mut().as_mut() {
+            h(secs);
+        }
         if let Some(cap) = self.real_sleep_cap {
             std::thread::sleep(std::time::Duration::from_secs_f64(secs.clamp(0.0, cap)));
         }

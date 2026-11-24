@@ -352,6 +352,17 @@ rm -f "$SOCK" "$E2E_ROOT/run/agent-display/vnc/$AO.json" "$E2E_ROOT/run/agent-di
 run ad tab unshow "$A"
 check "lost files: unshow stopped the viewer (was_shown true)" bash -c "test $rc -eq 0 && test $(active_viewers) -eq 0"
 
+echo "-- show while the tab's window is off its output: waits ~2 s, then 75 (try again)"
+AC=$(con "$AO")
+nsway "[con_id=$AC] move container to output HEADLESS-1" >/dev/null
+s=$SECONDS; run ad tab show "$A"; el=$((SECONDS - s))
+check "window away: exit 75 after ~2 s (${el} s), no viewer started" bash -c "test $rc -eq 75 && test $el -ge 1 -a $el -le 5 && test $(active_viewers) -eq 0"
+( sleep 0.7; nsway "[con_id=$AC] move container to output $AO" >/dev/null ) &
+run ad tab show "$A"
+wait
+check "window back during the wait: show goes on (exit 0)" bash -c "test $rc -eq 0 && test $(active_viewers) -eq 1"
+ad tab unshow "$A" >/dev/null
+
 echo "-- two concurrent shows of one tab: one viewer, both see its options"
 ad tab show "$A" > "$E2E_OUT/c1.json" 2>&1 & C1=$!
 ad tab show "$A" > "$E2E_OUT/c2.json" 2>&1 & C2=$!

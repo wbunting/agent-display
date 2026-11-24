@@ -969,3 +969,53 @@ fn active_viewer_without_its_socket_is_left_alone() {
     assert_eq!(f.cli(&["unshow", &tab]).0, 0);
     assert_eq!(f.cli(&["show", &tab]).0, 0);
 }
+
+// ------------------------------------------------------------ round 7
+
+fn move_window(f: &Fx, tab: &str, to: &str) {
+    let mut st = f.sw().st();
+    let id = *st.wins.iter().find(|(_, w)| w.tab.as_deref() == Some(tab)).unwrap().0;
+    st.wins.get_mut(&id).unwrap().output = to.into();
+}
+
+#[test]
+fn show_when_the_window_stays_off_its_output_is_75_and_starts_nothing() {
+    let f = fx();
+    let (tab, output) = opened(&f);
+    move_window(&f, &tab, "HEADLESS-1");
+    let (code, out, err) = f.cli(&["show", &tab]);
+    assert_eq!((code, out.as_str()), (75, ""), "{err}");
+    assert!(err.contains(&format!("tab {tab}'s window is not on {output} right now; try again")), "{err}");
+    assert!(viewer_runs(&f).is_empty());
+    // It waited ~2 s for the window first.
+    let waited: f64 = f.sys.sleeps.borrow().iter().filter(|s| **s == 0.05).sum();
+    assert!((1.9..=2.1).contains(&waited), "{waited}");
+}
+
+#[test]
+fn show_waits_for_a_window_that_is_briefly_off_its_output() {
+    // The window comes back after a few polls (a dialog closed): show goes on.
+    let f = fx();
+    let (tab, output) = opened(&f);
+    move_window(&f, &tab, "HEADLESS-1");
+    let sw = f.sw().clone();
+    let t2 = tab.clone();
+    let polls = std::rc::Rc::new(std::cell::Cell::new(0));
+    let p2 = polls.clone();
+    // Each sleep is one poll; put the window back on the 5th.
+    *f.sys.sleep_hook.borrow_mut() = Some(Box::new(move |secs| {
+        if secs == 0.05 {
+            p2.set(p2.get() + 1);
+            if p2.get() == 5 {
+                let mut st = sw.st();
+                let id = *st.wins.iter().find(|(_, w)| w.tab.as_deref() == Some(t2.as_str())).unwrap().0;
+                st.wins.get_mut(&id).unwrap().output = output.clone();
+            }
+        }
+    }));
+    let (code, out, err) = f.cli(&["show", &tab]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(lines(&out)[0]["shown"], tab.as_str());
+    assert_eq!(polls.get(), 5);
+    assert_eq!(viewer_runs(&f).len(), 1);
+}

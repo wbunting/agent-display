@@ -33,6 +33,10 @@ use crate::{bail, json};
 
 /// How often a foreground `show` checks the tab (URL, still open).
 const TAB_POLL: f64 = 0.5;
+/// How long `show` waits for a tab's window to be back on its output:
+/// WINDOW_WAIT_TRIES pauses of WINDOW_WAIT_STEP seconds (~2 s).
+const WINDOW_WAIT_TRIES: usize = 40;
+const WINDOW_WAIT_STEP: f64 = 0.05;
 /// A tab poll that keeps timing out is "browser busy" until it has failed
 /// this long (seconds); then the tab is looked up afresh.
 const STALL_RECHECK: f64 = 5.0;
@@ -294,8 +298,16 @@ pub fn cmd_tab_show(ctx: &Ctx, o: &TabOpts, tab: &str, s: &ShowOpts) -> Result<i
     let Some(output) = tab_output(ctx, tab) else {
         bail!("tab {tab} has no output of its own (opened before outputs existed, or sway couldn't add one); open a new tab with `tab open` and show that");
     };
-    if output_windows(ctx, &disp)?.get(&output).copied().unwrap_or(0) == 0 {
-        bail!("tab {tab}'s window is not on {output} right now; try again");
+    // The window can be briefly off its output (remapped: fullscreen, a
+    // dialog); wait a little for it, then it's "try again" (75), not 1.
+    let mut tries = 0;
+    while output_windows(ctx, &disp)?.get(&output).copied().unwrap_or(0) == 0 {
+        tries += 1;
+        if tries > WINDOW_WAIT_TRIES {
+            return Err(Error::new(format!("tab {tab}'s window is not on {output} right now; try again"))
+                .with_code(exit::TEMPFAIL));
+        }
+        ctx.sys.sleep(WINDOW_WAIT_STEP);
     }
     let unit = viewer_unit(&output);
     let sock = viewer_socket(ctx, &output);
